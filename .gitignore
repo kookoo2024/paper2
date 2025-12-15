@@ -1,0 +1,27 @@
+# 配置文件
+zhixue_config.json
+grading_history.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 截图
+*.png
+*.jpg
+*.jpeg
+
+# 日志
+*.log
