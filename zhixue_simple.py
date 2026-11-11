@@ -15,6 +15,8 @@ import threading
 
 
 import base64
+import urllib.request
+import urllib.error
 import io
 
 # 配置 Gemini API
@@ -56,10 +58,10 @@ PROVIDERS = {
     }
 }
 
-HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
+HTTP_TIMEOUT = 120  # 秒：连续这么久收不到任何数据才算超时（流式接收，长回答不会被误判）
 
 # ================= 在线更新 =================
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -130,6 +132,59 @@ def apply_update(info, base):
             fp.write(data)
         os.replace(tmp, dst)  # 原子替换
     return list(staged), bdir
+
+
+def image_to_data_url(image, max_side=1600):
+    """答题截图压缩成灰度 JPEG：手写清晰度够用，体积通常只有 PNG 的 1/5，上传更快"""
+    img = image.convert('L')
+    w, h = img.size
+    if max(w, h) > max_side:
+        k = max_side / max(w, h)
+        img = img.resize((int(w * k), int(h * k)))
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=88)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def post_chat_stream(url, data, headers, log=None):
+    """以流式方式请求 chat/completions，边收边拼；服务器不支持流式时按普通 JSON 解析。
+    超时只在“连续 HTTP_TIMEOUT 秒没收到任何数据”时触发。"""
+    import json
+    body = dict(data, stream=True)
+    req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers)
+    with http_open(req) as resp:
+        ctype = resp.headers.get('Content-Type', '')
+        if 'event-stream' not in ctype:
+            j = json.loads(resp.read().decode('utf-8'))
+            return j['choices'][0]['message']['content']
+        parts = []
+        for raw in resp:
+            line = raw.decode('utf-8', 'ignore').strip()
+            if not line.startswith('data:'):
+                continue
+            payload = line[5:].strip()
+            if payload == '[DONE]':
+                break
+            try:
+                j = json.loads(payload)
+            except ValueError:
+                continue
+            if j.get('error'):
+                raise Exception(str(j['error']))
+            for ch in j.get('choices') or []:
+                c = (ch.get('delta') or {}).get('content') or (ch.get('message') or {}).get('content')
+                if c:
+                    parts.append(c)
+        text = ''.join(parts)
+        if not text.strip():
+            raise Exception("模型没有返回内容")
+        return text
+
+
+def is_retryable(err):
+    m = str(err).lower()
+    return any(k in m for k in ('timed out', 'timeout', 'temporarily', 'connection reset', 'remote end closed',
+                                'api error 429', 'api error 500', 'api error 502', 'api error 503', 'api error 504'))
 
 
 def http_open(req, timeout=HTTP_TIMEOUT):
@@ -673,11 +728,22 @@ class SimpleGradingUI:
         """从参考答案里把「……（2分）」这类写了分值的行提取成给分点"""
         import re
         found = []
+        try:
+            mx_val = float(self.max_score_entry.get().strip())
+        except ValueError:
+            mx_val = None
         for line in self.answer_text.get('1.0', tk.END).splitlines():
             line = line.strip()
             m = re.search(r"^(.*?)[\s，,。；;]*[（(【\[]?\s*(?:得|给)?\s*([0-9]+(?:\.[0-9]+)?)\s*分\s*[)）】\]]?[。；;]?$", line)
             if m and m.group(1).strip():
                 point = m.group(1).strip().rstrip(" .…·")
+                if re.fullmatch(r"[（(]?[0-9一二三四五六七八九十]+[)）]?[.、．]?\s*(解[:：]?)?", point):
+                    continue   # 题号行，如「16.（15分）」，不是给分点
+                try:
+                    if mx_val and float(m.group(2)) >= mx_val:
+                        continue  # 和满分一样大，多半是整题总分
+                except ValueError:
+                    pass
                 if len(point) > 40:
                     point = point[:40] + "…"
                 found.append(f"{point}｜{m.group(2)}")
@@ -702,15 +768,10 @@ class SimpleGradingUI:
         except ValueError:
             mx = 0
         total = sum(v for _, v in items if v is not None)
-        if ans:
-            first = ans.splitlines()[0]
-            first = first if len(first) <= 16 else first[:16] + "…"
-            line1 = f"参考答案 {len(ans)} 字：{first}"
-        else:
-            line1 = "参考答案：未填写"
+        line1 = f"参考答案 {len(ans)} 字" if ans else "参考答案：未填写"
         if items:
             ok = abs(total - mx) < 0.01
-            line2 = f"给分点 {len(items)} 条，共 {fmt_score(total)} 分" + (" ✓" if ok else f"（满分 {fmt_score(mx)}）")
+            line2 = f"给分点 {len(items)} 条 {fmt_score(total)} 分" + (" ✓" if ok else f" ≠ 满分{fmt_score(mx)}")
         else:
             ok = True
             line2 = "给分点：未填，由 AI 拆分"
@@ -769,15 +830,15 @@ class SimpleGradingUI:
         _, body = self._card(main_frame, "② 题目", hint="自动保存", color=T['teal'])
         r = self._row(body)
         self._label(r, "题号").pack(side=tk.LEFT)
-        s = self._slot(r, width=64, padx=(6, 14))
+        s = self._slot(r, width=52, padx=(4, 10))
         self.question_num_entry = self._entry(s, 6)
         self.question_num_entry.pack(fill=tk.BOTH, expand=True)
         self._label(r, "满分").pack(side=tk.LEFT)
-        s = self._slot(r, width=48, padx=(6, 0))
+        s = self._slot(r, width=44, padx=(4, 0))
         self.max_score_entry = self._entry(s, 4)
         self.max_score_entry.pack(fill=tk.BOTH, expand=True)
         self.half_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(r, text="可给0.5", variable=self.half_var, command=self.save_config, font=(F, 8),
+        tk.Checkbutton(r, text="半分", variable=self.half_var, command=self.save_config, font=(F, 8),
                        bg=T['card'], fg=T['text'], activebackground=T['card'], selectcolor=T['teal_bg'],
                        bd=0, highlightthickness=0).pack(side=tk.RIGHT)
 
@@ -988,6 +1049,27 @@ class SimpleGradingUI:
             messagebox.showwarning("提示", "请输入或截图参考答案")
             return
         
+        # 给分点合计和满分对不上：先提醒（只在手动点开始时问，连续批改时不打断）
+        items = parse_rubric(self.rubric_text.get('1.0', tk.END))
+        if items and not self.auto_continue:
+            try:
+                mx = float(self.max_score_entry.get().strip())
+            except ValueError:
+                mx = None
+            total = sum(v for _, v in items if v is not None)
+            if mx is not None and abs(total - mx) > 0.01:
+                if messagebox.askyesno("给分点和满分对不上",
+                                       f"给分点合计 {fmt_score(total)} 分，满分是 {fmt_score(mx)} 分。\n\n"
+                                       "点「是」打开编辑窗口修改；点「否」照样批改（每份都会要求人工确认）。"):
+                    self.open_answer_editor()
+                    return
+
+        # 编辑窗口开着会挡住答卷，截图前先收起来
+        if self.editor.winfo_viewable():
+            self.close_answer_editor()
+            self.root.update()
+            time.sleep(0.15)
+
         # 自动保存题目数据（每次批改时）
         self.saved_question_num = self.question_num_entry.get().strip()
         self.saved_max_score = self.max_score_entry.get().strip()
@@ -1210,58 +1292,31 @@ class SimpleGradingUI:
             import urllib.error
             import json
             
-            # 转换图片为Base64
-            buffered = io.BytesIO()
-            image.save(buffered, format="PNG")
-            img_str = base64.b64encode(buffered.getvalue()).decode()
-            
-            # 构造 Vision 请求
             url = f"{base_url.rstrip('/')}/chat/completions"
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{img_str}"
-                            },
-                        },
-                    ],
-                }
-            ]
-            
-            data = {
-                "model": model_name,
-                "messages": messages,
-                "max_tokens": 4096,
-                "temperature": 0  # 阅卷要稳定，同一份卷子多次评分应一致
-            }
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": "ZhixueGrader/1.0"
-            }
-            
-            try:
-                req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-                with http_open(req) as response:
-                    result_str = response.read().decode('utf-8')
-                    result_json = json.loads(result_str)
-                    content = result_json['choices'][0]['message']['content']
-                    
-                    if need_json:
-                        return self.parse_json_result(content)
-                    else:
-                        return content
-                        
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode()
-                raise Exception(f"API Error {e.code}: {error_body}")
-            except Exception as e:
-                raise Exception(f"API Call Failed: {str(e)}")
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_to_data_url(image)}},
+            ]}]
+            data = {"model": model_name, "messages": messages, "max_tokens": 4096,
+                    "temperature": 0}  # 阅卷要稳定，同一份卷子多次评分应一致
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
+                       "User-Agent": "ZhixueGrader/1.0"}
+
+            last = None
+            for attempt in range(2):   # 超时 / 服务繁忙时自动重试一次
+                try:
+                    content = post_chat_stream(url, data, headers)
+                    return self.parse_json_result(content) if need_json else content
+                except urllib.error.HTTPError as e:
+                    last = Exception(f"API Error {e.code}: {e.read().decode('utf-8', 'ignore')[:300]}")
+                except Exception as e:
+                    last = Exception(f"API Call Failed: {e}") if 'API' not in str(e) else e
+                if attempt == 0 and is_retryable(last):
+                    self.log(f"  ⚠ {last}，5 秒后重试一次…")
+                    time.sleep(5)
+                    continue
+                break
+            raise last
 
     def _call_siliconflow_vision(self, api_key, model, prompt, image):
         """内部辅助：调用 SiliconFlow 的 Vision 模型进行 OCR"""
