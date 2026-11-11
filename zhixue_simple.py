@@ -59,7 +59,7 @@ PROVIDERS = {
 HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
 
 # ================= 在线更新 =================
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -283,7 +283,7 @@ class SimpleGradingUI:
         self._main_thread = threading.current_thread()
         self.root.title(f"阅卷 V{APP_VERSION}")
         
-        self.root.geometry("290x720")
+        self.root.geometry("300x800")
         self.root.resizable(False, False)  # 固定大小
         self.root.attributes('-topmost', True)  # 窗口置顶
 
@@ -361,97 +361,124 @@ class SimpleGradingUI:
         'input': '#F7F8FF',     # 输入框
     }
     FONT = '微软雅黑'
-    GRADE_TEXT = "▶ 批改  (空格)"
+    GRADE_TEXT = "▶ 开始批改"
+
+    # 统一尺寸：所有小按钮、输入行同高；主按钮同高
+    ROW_H = 26      # 普通一行（输入框、小按钮）
+    BIG_H = 38      # 批改 / 暂停
+    BAR_H = 44      # 顶栏
+    SMALL_W = 64    # 小按钮统一宽度
 
     def _btn(self, parent, text, cmd, bg, fg='white', size=8, bold=False, active=None, **kw):
         return tk.Button(
             parent, text=text, command=cmd, bg=bg, fg=fg,
             activebackground=active or bg, activeforeground=fg,
             font=(self.FONT, size, 'bold' if bold else 'normal'),
-            relief=tk.FLAT, bd=0, cursor='hand2', padx=kw.pop('padx', 6), pady=kw.pop('pady', 1), **kw)
+            relief=tk.FLAT, bd=0, cursor='hand2', padx=kw.pop('padx', 6), pady=kw.pop('pady', 0), **kw)
+
+    def _slot(self, parent, width=None, height=None, side=tk.LEFT, padx=0, expand=False):
+        """固定尺寸的格子：放进去的控件撑满格子，保证同一行控件一样高、一样宽"""
+        f = tk.Frame(parent, bg=parent.cget('bg'), width=width or 1, height=height or self.ROW_H)
+        f.pack_propagate(False)
+        f.pack(side=side, padx=padx, fill=tk.X if expand else None, expand=expand)
+        return f
+
+    def _small(self, parent, text, cmd, bg, fg, active, side=tk.RIGHT, padx=0, width=None):
+        slot = self._slot(parent, width=width or self.SMALL_W, side=side, padx=padx)
+        b = self._btn(slot, text, cmd, bg, fg=fg, active=active)
+        b.pack(fill=tk.BOTH, expand=True)
+        return b
+
+    def _row(self, parent, gap=6):
+        r = tk.Frame(parent, bg=self.THEME['card'], height=self.ROW_H)
+        r.pack_propagate(False)
+        r.pack(fill=tk.X, pady=(0, gap))
+        return r
 
     def _entry(self, parent, width):
         T = self.THEME
         return tk.Entry(parent, width=width, font=(self.FONT, 9), relief=tk.FLAT, bg=T['input'], fg=T['text'],
                         highlightthickness=1, highlightbackground=T['line'], highlightcolor=T['primary'],
-                        insertbackground=T['text'])
+                        insertbackground=T['text'], justify=tk.CENTER)
+
+    def _label(self, parent, text, **kw):
+        T = self.THEME
+        return tk.Label(parent, text=text, font=(self.FONT, 8), bg=T['card'], fg=kw.pop('fg', T['sub']), **kw)
 
     def _card(self, parent, title, hint=None, expand=False, color=None):
-        """卡片式分组：白底细边框 + 小标题，返回内容区"""
+        """卡片式分组：白底细边框 + 彩色小标题，返回内容区"""
         T = self.THEME
         outer = tk.Frame(parent, bg=T['card'], highlightthickness=1, highlightbackground=T['line'])
-        outer.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(0, 6))
-        head = tk.Frame(outer, bg=T['card'])
-        head.pack(fill=tk.X, padx=8, pady=(5, 2))
-        tk.Frame(head, bg=color or T['primary'], width=4, height=13).pack(side=tk.LEFT, padx=(0, 5))
-        tk.Label(head, text=title, font=(self.FONT, 8, 'bold'), bg=T['card'], fg=color or T['text']).pack(side=tk.LEFT)
+        outer.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(0, 8))
+        head = tk.Frame(outer, bg=T['card'], height=24)
+        head.pack_propagate(False)
+        head.pack(fill=tk.X, padx=10, pady=(4, 2))
+        tk.Frame(head, bg=color or T['primary'], width=4, height=14).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(head, text=title, font=(self.FONT, 9, 'bold'), bg=T['card'], fg=color or T['text']).pack(side=tk.LEFT)
         if hint:
-            tk.Label(head, text=hint, font=(self.FONT, 7), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT, padx=(5, 0))
+            tk.Label(head, text=hint, font=(self.FONT, 7), bg=T['card'], fg=T['sub']).pack(side=tk.RIGHT)
         body = tk.Frame(outer, bg=T['card'])
-        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 7))
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(2, 10))
         return head, body
 
     def create_widgets(self):
-        """创建界面（紧凑卡片式）"""
+        """创建界面（紧凑卡片式，统一行高）"""
         T, F = self.THEME, self.FONT
         self.root.configure(bg=T['bg'])
 
-        # ===== 顶栏：标题 + 版本 + 工具按钮 =====
-        bar = tk.Frame(self.root, bg=T['head'], height=40)
+        # ===== 顶栏：标题 + 版本 + 工具按钮（三个按钮同宽同高）=====
+        bar = tk.Frame(self.root, bg=T['head'], height=self.BAR_H)
         bar.pack(fill=tk.X)
         bar.pack_propagate(False)
-        tk.Label(bar, text="阅卷", font=(F, 13, 'bold'), bg=T['head'], fg='white').pack(side=tk.LEFT, padx=(12, 4))
+        tk.Label(bar, text="阅卷", font=(F, 14, 'bold'), bg=T['head'], fg='white').pack(side=tk.LEFT, padx=(12, 6))
         tk.Label(bar, text=f"V{APP_VERSION}", font=('Consolas', 7, 'bold'), bg=T['badge'], fg=T['text'],
-                 padx=4, pady=1).pack(side=tk.LEFT, pady=(4, 0))
+                 padx=5, pady=1).pack(side=tk.LEFT)
 
-        tools = tk.Frame(bar, bg=T['head'])
-        tools.pack(side=tk.RIGHT, padx=8)
-        self.update_btn = self._btn(tools, "更新", lambda: self.check_update_ui(silent=False), T['head2'],
-                                    active='#4A4ED8', padx=7, pady=3)
-        self.update_btn.pack(side=tk.RIGHT)
-        self._btn(tools, "笔记", self.setup_obsidian_path, T['head2'], active='#4A4ED8',
-                  padx=7, pady=3).pack(side=tk.RIGHT, padx=(0, 3))
-        self._btn(tools, "模型", self.setup_model, T['head2'], active='#4A4ED8',
-                  padx=7, pady=3).pack(side=tk.RIGHT, padx=(0, 3))
+        tools = tk.Frame(bar, bg=T['head'], height=self.ROW_H)
+        tools.pack(side=tk.RIGHT, padx=10)
+        self.update_btn = self._small(tools, "更新", lambda: self.check_update_ui(silent=False),
+                                      T['head2'], 'white', '#4A4ED8', width=42)
+        self._small(tools, "笔记", self.setup_obsidian_path, T['head2'], 'white', '#4A4ED8', padx=4, width=42)
+        self._small(tools, "模型", self.setup_model, T['head2'], 'white', '#4A4ED8', width=42)
 
         # ===== 底部状态栏 =====
-        status = tk.Frame(self.root, bg=T['head'])
+        status = tk.Frame(self.root, bg=T['head'], height=22)
+        status.pack_propagate(False)
         status.pack(fill=tk.X, side=tk.BOTTOM)
-        self.stats_label = tk.Label(status, text="已批 0 · 用时 0s · 均 0s · 0/h", font=(F, 7),
+        self.stats_label = tk.Label(status, text="已批 0 · 用时 0s · 均 0s · 0/h", font=(F, 8),
                                     fg='white', bg=T['head'])
-        self.stats_label.pack(pady=2)
+        self.stats_label.pack(expand=True)
 
-        main_frame = tk.Frame(self.root, bg=T['bg'], padx=8, pady=8)
+        main_frame = tk.Frame(self.root, bg=T['bg'], padx=10, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # ===== ① 答题区域 =====
         _, body = self._card(main_frame, "① 答题区域", color=T['cyan'])
-        self.region_preview = tk.Label(body, text="未框选", bg='#E6F9FD', fg=T['sub'], font=(F, 8),
-                                       anchor='w', padx=6, pady=2)
-        self.region_preview.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._btn(body, "框选", self.setup_region, T['cyan'], active='#0097B2',
-                  padx=10, pady=2).pack(side=tk.RIGHT, padx=(6, 0))
+        r = self._row(body, gap=0)
+        self._small(r, "框选", self.setup_region, T['cyan'], 'white', '#0097B2')
+        slot = self._slot(r, side=tk.LEFT, padx=(0, 6), expand=True)
+        self.region_preview = tk.Label(slot, text="未框选", bg='#E6F9FD', fg=T['sub'], font=(F, 8), anchor='w', padx=8)
+        self.region_preview.pack(fill=tk.BOTH, expand=True)
 
         # ===== ② 题目 =====
         _, body = self._card(main_frame, "② 题目", hint="自动保存", expand=True, color=T['purple'])
-        row = tk.Frame(body, bg=T['card'])
-        row.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(row, text="题号", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
-        self.question_num_entry = self._entry(row, 6)
-        self.question_num_entry.pack(side=tk.LEFT, padx=(3, 8), ipady=1)
-        tk.Label(row, text="满分", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
-        self.max_score_entry = self._entry(row, 4)
-        self.max_score_entry.pack(side=tk.LEFT, padx=3, ipady=1)
+        r = self._row(body)
+        self._label(r, "题号").pack(side=tk.LEFT)
+        s = self._slot(r, width=64, padx=(6, 14))
+        self.question_num_entry = self._entry(s, 6)
+        self.question_num_entry.pack(fill=tk.BOTH, expand=True)
+        self._label(r, "满分").pack(side=tk.LEFT)
+        s = self._slot(r, width=48, padx=(6, 0))
+        self.max_score_entry = self._entry(s, 4)
+        self.max_score_entry.pack(fill=tk.BOTH, expand=True)
 
-        row2 = tk.Frame(body, bg=T['card'])
-        row2.pack(fill=tk.X, pady=(0, 2))
-        tk.Label(row2, text="参考答案", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
-        self._btn(row2, "清空", lambda: (self.answer_text.delete('1.0', tk.END), self.save_question_data()),
-                  '#F1EEFF', fg=T['purple'], size=7, active='#E4DDFF').pack(side=tk.RIGHT)
-        self._btn(row2, "截图识别", self.capture_standard_answer, T['purple'], size=7,
-                  active='#7342E8').pack(side=tk.RIGHT, padx=(0, 4))
+        r = self._row(body)
+        self._label(r, "参考答案").pack(side=tk.LEFT)
+        self._small(r, "清空", lambda: (self.answer_text.delete('1.0', tk.END), self.save_question_data()),
+                    '#F1EEFF', T['purple'], '#E4DDFF', width=48)
+        self._small(r, "截图识别", self.capture_standard_answer, T['purple'], 'white', '#7342E8', padx=(0, 6))
 
-        self.answer_text = scrolledtext.ScrolledText(body, height=3, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
+        self.answer_text = scrolledtext.ScrolledText(body, height=4, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
                                                      bg=T['input'], fg=T['text'], highlightthickness=1,
                                                      highlightbackground=T['line'], highlightcolor=T['primary'])
         self.answer_text.pack(fill=tk.BOTH, expand=True)
@@ -461,55 +488,58 @@ class SimpleGradingUI:
             w.bind('<KeyRelease>', lambda e: self.save_question_data())
 
         # ===== ③ 批改控制 =====
-        _, body = self._card(main_frame, "③ 批改", color=T['orange'])
-        btns = tk.Frame(body, bg=T['card'])
-        btns.pack(fill=tk.X, pady=(0, 5))
-        self.grade_btn = self._btn(btns, self.GRADE_TEXT, self.grade_answer, T['primary'], size=10, bold=True,
-                                   active=T['primary_d'], pady=4)
-        self.grade_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        self.pause_btn = self._btn(btns, "⏸ 暂停", self.toggle_pause, T['slate'], size=9, bold=True,
-                                   pady=4, state=tk.DISABLED, disabledforeground='#E4DDFF')
-        self.pause_btn.pack(side=tk.LEFT, ipadx=4)
+        _, body = self._card(main_frame, "③ 批改", hint="空格 开始 · Esc 停止", color=T['orange'])
+        big = tk.Frame(body, bg=T['card'], height=self.BIG_H)
+        big.pack_propagate(False)
+        big.pack(fill=tk.X, pady=(0, 8))
+        s = self._slot(big, width=84, height=self.BIG_H, side=tk.RIGHT)
+        self.pause_btn = self._btn(s, "⏸ 暂停", self.toggle_pause, T['slate'], size=10, bold=True,
+                                   state=tk.DISABLED, disabledforeground='#E4DDFF')
+        self.pause_btn.pack(fill=tk.BOTH, expand=True)
+        s = self._slot(big, height=self.BIG_H, side=tk.LEFT, padx=(0, 6), expand=True)
+        self.grade_btn = self._btn(s, self.GRADE_TEXT, self.grade_answer, T['primary'], size=10, bold=True,
+                                   active=T['primary_d'])
+        self.grade_btn.pack(fill=tk.BOTH, expand=True)
 
-        checks = tk.Frame(body, bg=T['card'])
-        checks.pack(fill=tk.X, pady=(0, 3))
+        r = self._row(body)
+        for i in range(3):
+            r.grid_columnconfigure(i, weight=1, uniform='ck')
+        r.grid_rowconfigure(0, weight=1)
         ck = dict(font=(F, 8), bg=T['card'], fg=T['text'], activebackground=T['card'],
-                  selectcolor='#FFF3EC', bd=0, highlightthickness=0)
+                  selectcolor='#FFF3EC', bd=0, highlightthickness=0, anchor='w')
         self.auto_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(checks, text="连续", variable=self.auto_var, command=self.on_checkbox_changed, **ck).pack(side=tk.LEFT)
+        tk.Checkbutton(r, text="连续", variable=self.auto_var, command=self.on_checkbox_changed, **ck).grid(row=0, column=0, sticky='w')
         self.auto_click_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(checks, text="自动填分", variable=self.auto_click_var, command=self.save_config, **ck).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Checkbutton(r, text="自动填分", variable=self.auto_click_var, command=self.save_config, **ck).grid(row=0, column=1, sticky='w')
         self.skip_confirm_var = tk.BooleanVar(value=False)
-        ck_skip = dict(ck, fg=T['warn'])
-        tk.Checkbutton(checks, text="跳过确认", variable=self.skip_confirm_var, command=self.save_config, **ck_skip).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Checkbutton(r, text="跳过确认", variable=self.skip_confirm_var, command=self.save_config,
+                       **dict(ck, fg=T['warn'])).grid(row=0, column=2, sticky='w')
 
-        opts = tk.Frame(body, bg=T['card'])
-        opts.pack(fill=tk.X)
-        tk.Label(opts, text="间隔", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
-        self.delay_entry = self._entry(opts, 3)
+        r = self._row(body, gap=0)
+        self._label(r, "间隔").pack(side=tk.LEFT)
+        s = self._slot(r, width=36, padx=(6, 4))
+        self.delay_entry = self._entry(s, 3)
         self.delay_entry.insert(0, "3")
-        self.delay_entry.pack(side=tk.LEFT, padx=2)
+        self.delay_entry.pack(fill=tk.BOTH, expand=True)
         self.delay_entry.bind('<FocusOut>', lambda e: self.save_config())
-        tk.Label(opts, text="秒", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
-        self.setup_status_label = tk.Label(opts, text="● 未定位", font=(F, 7), bg=T['card'], fg=T['danger'])
-        self.setup_status_label.pack(side=tk.RIGHT)
-        self._btn(opts, "测试", self.test_auto_click, '#FFF0E8', fg=T['orange'], size=7,
-                  active='#FFE0D0').pack(side=tk.RIGHT, padx=(0, 6))
-        self._btn(opts, "定位", self.setup_score_buttons, '#FFF0E8', fg=T['orange'], size=7,
-                  active='#FFE0D0').pack(side=tk.RIGHT, padx=(0, 3))
+        self._label(r, "秒").pack(side=tk.LEFT)
+        self._small(r, "测试", self.test_auto_click, '#FFF0E8', T['orange'], '#FFE0D0', width=48)
+        self._small(r, "定位", self.setup_score_buttons, '#FFF0E8', T['orange'], '#FFE0D0', padx=(0, 6), width=48)
+        self.setup_status_label = tk.Label(r, text="● 未定位", font=(F, 8), bg=T['card'], fg=T['danger'])
+        self.setup_status_label.pack(side=tk.RIGHT, padx=(0, 8))
 
         # ===== ④ 结果 =====
         _, body = self._card(main_frame, "④ 结果", expand=True, color=T['green'])
         self.current_result_frame = tk.Frame(body, bg=T['tint'])
-        self.current_result_frame.pack(fill=tk.X, pady=(0, 4))
-        self.current_score_label = tk.Label(self.current_result_frame, text="建议分数  --", font=(F, 13, 'bold'),
+        self.current_result_frame.pack(fill=tk.X, pady=(0, 8))
+        self.current_score_label = tk.Label(self.current_result_frame, text="建议分数  --", font=(F, 14, 'bold'),
                                             bg=T['tint'], fg=T['primary'])
-        self.current_score_label.pack(pady=(4, 0))
-        self.current_analysis_label = tk.Label(self.current_result_frame, text="", font=(F, 7), bg=T['tint'],
-                                               fg=T['sub'], wraplength=232, justify=tk.LEFT)
-        self.current_analysis_label.pack(pady=(0, 4), padx=6)
+        self.current_score_label.pack(pady=(6, 0))
+        self.current_analysis_label = tk.Label(self.current_result_frame, text="", font=(F, 8), bg=T['tint'],
+                                               fg=T['sub'], wraplength=240, justify=tk.LEFT)
+        self.current_analysis_label.pack(pady=(2, 6), padx=8)
 
-        self.result_text = scrolledtext.ScrolledText(body, height=8, font=(F, 7), wrap=tk.WORD, relief=tk.FLAT,
+        self.result_text = scrolledtext.ScrolledText(body, height=8, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
                                                      bg=T['input'], fg=T['sub'], highlightthickness=1,
                                                      highlightbackground=T['line'])
         self.result_text.pack(fill=tk.BOTH, expand=True)
@@ -1246,7 +1276,7 @@ class SimpleGradingUI:
         self.auto_continue = self.auto_var.get()
         if self.auto_continue:
             self.log("✓ 已开启自动连续批改")
-            self.grade_btn.config(text="▶ 开始连续批改")
+            self.grade_btn.config(text="▶ 连续批改")
         else:
             self.log("⏸ 已关闭自动连续批改")
             self.grade_btn.config(text=self.GRADE_TEXT)

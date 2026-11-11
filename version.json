@@ -1,8 +1,8 @@
 {
-  "version": "1.2.1",
-  "notes": "配色改为鲜艳活泼风：靛蓝顶栏、明黄版本标签、四块卡片各用青/紫/橙/绿主题色，橙色批改大按钮",
+  "version": "1.2.2",
+  "notes": "界面规整：批改/暂停按钮等高，所有小按钮同宽同高，行高统一，勾选项三等分对齐；窗口加高到 800",
   "files": {
-    "zhixue_simple.py": "e866a1fedd74cbedbaedf944b7352cfb24b22b86f0ce32ce552da97c1def85c0",
+    "zhixue_simple.py": "e1709c1a6cd43795fa08106dc1ce811717d940f23a97cf514655ea46dbe7c939",
     "start.pyw": "df2bda5027b52182584f74fc587977a484742792d53d8f21bd5a174012995249",
     "make_shortcut.bat": "925555f845c456b3211ad06c624bf67a64f2f4fc58c5a35817995f169477f3c9",
     "README.md": "b39cdbd95e26808f9775632f4ee77b6f1659befc0918d38d50b66e7b513e1f01",
