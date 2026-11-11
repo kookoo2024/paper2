@@ -27,3 +27,9 @@ venv/
 # 日志
 *.log
 keys.json
+
+# 本地生成/实验（含学生答卷，不入库）
+backup/
+Grading_HTML/
+work/
+zhixue_simple_config1.json
