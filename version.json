@@ -1,8 +1,8 @@
 {
-  "version": "1.5.0",
-  "notes": "回到原设计：框选图片+提示词一次发给模型、一次性收结果（去掉流式）；Gemini 恢复用官方库直接调用；批改提示词重写，更短更明确，模型只回简短 JSON；日志显示每份耗时",
+  "version": "1.5.1",
+  "notes": "模型设置：预设 11 家提供商的地址（Gemini、硅基流动、阿里云百炼、智谱、火山方舟、Kimi、DeepSeek、OpenAI、OpenRouter、Magpie、自定义），选好只需填 Key；每家附说明和「去申请 Key」链接；各家 Key 分别保存；修复首次使用时打开模型设置报错",
   "files": {
-    "zhixue_simple.py": "6d867c2249c6d7152920ead2d84471a97258158ad963f70450ccaeb441a6f6f0",
+    "zhixue_simple.py": "2bfbea74e1b9f5ff3df3a9ed87b4b0b0cd1247158f0c9a4d72d3fce77333744e",
     "start.pyw": "df2bda5027b52182584f74fc587977a484742792d53d8f21bd5a174012995249",
     "make_shortcut.bat": "925555f845c456b3211ad06c624bf67a64f2f4fc58c5a35817995f169477f3c9",
     "README.md": "329d6ac06cc2fe773f6617efa6cc6eaa0bfe2543f42e137707c9daf97127cf83",

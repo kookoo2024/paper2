@@ -33,36 +33,80 @@ DEFAULT_CONFIG = {
 
 # 预设提供商配置
 PROVIDERS = {
+    # base_url 已预设好，选好提供商后只需填 Key；key_url 是申请 Key 的网址
     "Gemini": {
         "base_url": "",
-        "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
-    },
-
-    "DeepSeek": {
-        "base_url": "https://api.siliconflow.cn/v1",
-        "models": ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V2.5", "deepseek-ai/Janus-Pro-7B"]
+        "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
+        "key_url": "https://aistudio.google.com/apikey",
+        "note": "谷歌官方，需能访问谷歌",
     },
     "SiliconFlow": {
         "base_url": "https://api.siliconflow.cn/v1",
-        "models": ["Qwen/Qwen2.5-VL-72B-Instruct", "Qwen/Qwen2.5-VL-32B-Instruct", "Qwen/Qwen3-VL-32B-Instruct", "Qwen/Qwen2-VL-72B-Instruct"]
+        "models": ["Qwen/Qwen2.5-VL-72B-Instruct", "Qwen/Qwen2.5-VL-32B-Instruct", "Qwen/Qwen3-VL-32B-Instruct", "Qwen/Qwen2-VL-72B-Instruct"],
+        "key_url": "https://cloud.siliconflow.cn/account/ak",
+        "note": "硅基流动，国内直连",
+    },
+    "阿里云百炼": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "models": ["qwen-vl-max", "qwen-vl-plus", "qwen3-vl-plus", "qwen3-vl-flash", "qwen2.5-vl-72b-instruct"],
+        "key_url": "https://bailian.console.aliyun.com/?apiKey=1",
+        "note": "通义千问 VL，国内直连",
+    },
+    "智谱": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "models": ["glm-4.5v", "glm-4v-plus-0111", "glm-4v-flash"],
+        "key_url": "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
+        "note": "GLM 识图模型，glm-4v-flash 免费",
+    },
+    "火山方舟": {
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "models": ["doubao-seed-1-6-flash-250828", "doubao-seed-1-6-vision-250815", "doubao-1-5-vision-pro-32k-250115"],
+        "key_url": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey",
+        "note": "豆包识图模型，需先在控制台开通对应模型",
+    },
+    "Kimi": {
+        "base_url": "https://api.moonshot.cn/v1",
+        "models": ["moonshot-v1-8k-vision-preview", "moonshot-v1-32k-vision-preview", "kimi-latest"],
+        "key_url": "https://platform.moonshot.cn/console/api-keys",
+        "note": "月之暗面",
+    },
+    "DeepSeek": {
+        "base_url": "https://api.deepseek.com",
+        "models": ["deepseek-chat"],
+        "key_url": "https://platform.deepseek.com/api_keys",
+        "note": "官方模型只认文字、不能看图，阅卷请选其他家",
+    },
+    "OpenAI": {
+        "base_url": "https://api.openai.com/v1",
+        "models": ["gpt-4.1-mini", "gpt-4o-mini", "gpt-5-mini", "gpt-4.1"],
+        "key_url": "https://platform.openai.com/api-keys",
+        "note": "需能访问 OpenAI",
+    },
+    "OpenRouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "models": ["google/gemini-2.5-flash", "qwen/qwen2.5-vl-72b-instruct", "openai/gpt-4.1-mini"],
+        "key_url": "https://openrouter.ai/keys",
+        "note": "一个 Key 用多家模型",
     },
     "Magpie": {
         # 本机 magpie 网关（https://usemagpie.ai），任意 key 均可，用 magpie-<应用名> 方便在 Usage 里区分
         "base_url": "http://127.0.0.1:3425/v1",
         "default_key": "magpie-zhixue",
-        "models": []  # 运行时从 /v1/models 获取
+        "models": [],  # 运行时从 /v1/models 获取
+        "note": "本机 magpie 网关，Key 已默认填好",
     },
     "Custom": {
         "base_url": "http://localhost:11434/v1",
-        "models": []
-    }
+        "models": [],
+        "note": "自定义（默认本机 Ollama），地址可改",
+    },
 }
 
 GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 HTTP_TIMEOUT = 120  # 秒：连续这么久收不到任何数据才算超时（流式接收，长回答不会被误判）
 
 # ================= 在线更新 =================
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -240,6 +284,8 @@ def no_think_params(model_name, base_url):
     u = (base_url or '').lower()
     if 'siliconflow' in u:
         return {"enable_thinking": False}
+    if 'bigmodel.cn' in u or 'volces.com' in u:
+        return {"thinking": {"type": "disabled"}} if ('4.5v' in m or 'seed' in m or '4.1v' in m) else {}
     if 'gemini-2.5' in m or 'gemini-3' in m:
         return {"reasoning_effort": "none"} if 'pro' not in m else {"reasoning_effort": "low"}
     if m.startswith(('gpt-5', 'o3', 'o4')) or '/gpt-5' in m:
@@ -518,6 +564,7 @@ def ink_ratio(img):
 class SimpleGradingUI:
     def __init__(self, root):
         self.root = root
+        self.provider_settings = {}   # 各提供商各自的 Key / 模型（没有配置文件时也要有）
         # 线程安全的界面更新队列：后台线程只往队列里放函数，由主线程执行
         import queue
         self._uiq = queue.Queue()
@@ -1375,7 +1422,7 @@ class SimpleGradingUI:
                     return self.parse_json_result(content) if need_json else content
                 except urllib.error.HTTPError as e:
                     msg = e.read().decode('utf-8', 'ignore')[:300]
-                    extra = [k for k in ("enable_thinking", "reasoning_effort") if k in data]
+                    extra = [k for k in ("enable_thinking", "reasoning_effort", "thinking") if k in data]
                     if e.code == 400 and 'temperature' in msg and 'temperature' in data:
                         extra.append('temperature')   # 部分模型（如 gpt-5）只接受默认温度
                     if e.code == 400 and extra:
@@ -1483,7 +1530,7 @@ class SimpleGradingUI:
         """设置模型和API"""
         dialog = tk.Toplevel(self.root)
         dialog.title("模型设置")
-        dialog.geometry("320x600")
+        dialog.geometry("340x660")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -1502,7 +1549,8 @@ class SimpleGradingUI:
         # 优先使用 stored settings，如果不存在则使用 active config
         # 这解决了"用户修改配置文件但未生效"或"配置不同步"的问题
         initial_settings = self.provider_settings.get(current_provider, {})
-        initial_url = initial_settings.get('base_url', self.config.get('base_url', ''))
+        initial_url = (initial_settings.get('base_url') or self.config.get('base_url', '')
+                       or PROVIDERS.get(current_provider, {}).get('base_url', ''))
         initial_key = initial_settings.get('api_key', self.config.get('api_key', ''))
         initial_model = initial_settings.get('model_name', self.config.get('model_name', ''))
         
@@ -1526,6 +1574,23 @@ class SimpleGradingUI:
         key_entry = tk.Entry(frame, font=('Consolas', 9), show="*")
         key_entry.pack(fill=tk.X, pady=(2, 10))
         key_entry.insert(0, initial_key)
+
+        info_lbl = tk.Label(frame, text="", font=('微软雅黑', 8), fg='#5F7385', justify=tk.LEFT, wraplength=290, anchor='w')
+        info_lbl.pack(fill=tk.X, pady=(0, 2))
+        link_lbl = tk.Label(frame, text="", font=('微软雅黑', 8, 'underline'), fg='#1C7ED6', cursor='hand2', anchor='w')
+        link_lbl.pack(fill=tk.X, pady=(0, 10))
+
+        def show_info(p):
+            info = PROVIDERS.get(p, {})
+            info_lbl.config(text=info.get('note', ''))
+            link_lbl.config(text="→ 去申请 Key" if info.get('key_url') else "")
+        def open_key_page(_e=None):
+            u = PROVIDERS.get(provider_combo.get(), {}).get('key_url')
+            if u:
+                import webbrowser
+                webbrowser.open(u)
+        link_lbl.bind('<Button-1>', open_key_page)
+        show_info(current_provider)
         
         # 4. 模型名称
         tk.Label(frame, text="模型名称:", font=('微软雅黑', 9)).pack(anchor='w')
@@ -1588,7 +1653,7 @@ class SimpleGradingUI:
             
             # URL
             default_url = PROVIDERS.get(new_p, {}).get("base_url", "")
-            new_url = settings.get('base_url', default_url)
+            new_url = settings.get('base_url') or default_url   # 没改过就用预设地址
             url_entry.delete(0, tk.END)
             url_entry.insert(0, new_url)
             
@@ -1611,6 +1676,7 @@ class SimpleGradingUI:
             
             # 更新引用
             last_provider_ref[0] = new_p
+            show_info(new_p)
 
             # Magpie / Custom 自动拉取模型
             if new_p in ('Magpie', 'Custom'):
@@ -1619,7 +1685,7 @@ class SimpleGradingUI:
         provider_combo.bind("<<ComboboxSelected>>", on_provider_change)
         
         # 说明
-        tk.Label(frame, text="说明：\nGemini无需Base URL\nMagpie：先打开本机 magpie，选它后点“获取模型”\n切换时会自动暂存当前输入", 
+        tk.Label(frame, text="说明：选提供商后地址自动填好，只需填 Key\n模型可从下拉选，也可点“获取模型”\n切换时会自动暂存各家的 Key", 
                  font=('微软雅黑', 8), fg='#666', justify=tk.LEFT).pack(anchor='w', pady=(0, 15))
         
         def save():
