@@ -61,7 +61,7 @@ PROVIDERS = {
 HTTP_TIMEOUT = 120  # 秒：连续这么久收不到任何数据才算超时（流式接收，长回答不会被误判）
 
 # ================= 在线更新 =================
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -146,18 +146,43 @@ def image_to_data_url(image, max_side=1600):
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def post_chat_plain(url, data, headers):
+    import json
+    body = dict(data)
+    body.pop('stream', None)
+    req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers)
+    with http_open(req) as resp:
+        j = json.loads(resp.read().decode('utf-8'))
+    msg = j['choices'][0]['message']
+    text = msg.get('content') or ''
+    if not text.strip():
+        if msg.get('reasoning_content'):
+            raise Exception(REASONING_ONLY_MSG)
+        raise Exception("模型没有返回内容")
+    return text
+
+
+REASONING_ONLY_MSG = ("模型只输出了思考过程、没给出结果（这是推理/思考型模型，太慢且容易超长）。"
+                      "建议在「模型」里换一个不带 thinking/R1/推理 字样的识图模型")
+
+
 def post_chat_stream(url, data, headers, log=None):
-    """以流式方式请求 chat/completions，边收边拼；服务器不支持流式时按普通 JSON 解析。
+    """以流式方式请求 chat/completions，边收边拼，并每 5 秒报一次进度；
+    服务器不支持流式时按普通 JSON 解析；流式拿不到内容时再用普通方式请求一次。
     超时只在“连续 HTTP_TIMEOUT 秒没收到任何数据”时触发。"""
     import json
     body = dict(data, stream=True)
     req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers)
+    t0 = last_report = time.time()
+    parts, think_chars, finish = [], 0, None
     with http_open(req) as resp:
         ctype = resp.headers.get('Content-Type', '')
         if 'event-stream' not in ctype:
             j = json.loads(resp.read().decode('utf-8'))
-            return j['choices'][0]['message']['content']
-        parts = []
+            msg = j['choices'][0]['message']
+            if not (msg.get('content') or '').strip():
+                raise Exception(REASONING_ONLY_MSG if msg.get('reasoning_content') else "模型没有返回内容")
+            return msg['content']
         for raw in resp:
             line = raw.decode('utf-8', 'ignore').strip()
             if not line.startswith('data:'):
@@ -172,13 +197,33 @@ def post_chat_stream(url, data, headers, log=None):
             if j.get('error'):
                 raise Exception(str(j['error']))
             for ch in j.get('choices') or []:
-                c = (ch.get('delta') or {}).get('content') or (ch.get('message') or {}).get('content')
+                d = ch.get('delta') or ch.get('message') or {}
+                c = d.get('content')
+                if isinstance(c, list):   # 少数接口把内容拆成数组
+                    c = ''.join(x.get('text', '') for x in c if isinstance(x, dict))
                 if c:
                     parts.append(c)
-        text = ''.join(parts)
-        if not text.strip():
-            raise Exception("模型没有返回内容")
+                rc = d.get('reasoning_content') or d.get('reasoning')
+                if rc:
+                    think_chars += len(rc)
+                finish = ch.get('finish_reason') or finish
+            if log and time.time() - last_report >= 5:
+                last_report = time.time()
+                got = sum(len(x) for x in parts)
+                if got:
+                    log(f"  …已收到 {got} 字（{time.time() - t0:.0f} 秒）")
+                elif think_chars:
+                    log(f"  …模型思考中，已想了 {think_chars} 字（{time.time() - t0:.0f} 秒）")
+                else:
+                    log(f"  …等待模型回应（{time.time() - t0:.0f} 秒）")
+    text = ''.join(parts)
+    if text.strip():
         return text
+    if think_chars:
+        raise Exception(REASONING_ONLY_MSG)
+    if log:
+        log("  流式没拿到内容，改用普通方式再请求一次…")
+    return post_chat_plain(url, data, headers)
 
 
 def is_retryable(err):
@@ -373,8 +418,8 @@ def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, 
 {rubric_part}
 
 请严格按下面两步做：
-第一步：把学生写的内容原样转写出来（公式用文字或 LaTeX），只写看到的，不要补全、不要纠正。某处字迹实在看不清，就在那里写【看不清】，绝不猜。
-第二步：对照转写内容，逐个给分点判定得分。
+第一步：看清学生写了什么。只认看到的，不要补全、不要纠正；某处字迹实在看不清，就记为【看不清】，绝不猜。
+第二步：逐个给分点判定得分。
 - 学生用了与参考答案不同但正确的方法，按对应步骤等价给分，并把 alt_method 设为 true。
 - 结果正确但关键步骤缺失，只给结果分；过程正确但最后算错，给过程分。
 - 前面一步算错导致后面数值不对、但后面方法正确的，后面的步骤酌情给分。
@@ -383,16 +428,17 @@ def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, 
 
 只返回 JSON，字段顺序如下：
 {{
-  "transcription": "学生作答的原样转写",
+  "transcription": "学生关键步骤和最终结果的简要摘录，不超过60字，看不清处写【看不清】",
   "items": [
-    {{"point": "给分点内容", "full": 该点分值, "got": 学生该点得分, "reason": "得分或扣分理由，一句话"}}
+    {{"point": "给分点内容", "full": 该点分值, "got": 学生该点得分, "reason": "理由，15字以内"}}
   ],
   "score": 各点得分之和,
   "confidence": "高 或 中 或 低（对识别和判分的把握）",
   "unclear": 是否有影响判分的看不清之处(true/false),
   "alt_method": 是否用了参考答案以外的解法(true/false),
-  "analysis": "一两句评语"
-}}"""
+  "analysis": "评语，20字以内"
+}}
+回答要简短，不要输出 JSON 以外的任何内容。"""
 
 
 def settle_score(result, max_score, half_point):
@@ -1299,19 +1345,25 @@ class SimpleGradingUI:
             ]}]
             data = {"model": model_name, "messages": messages, "max_tokens": 4096,
                     "temperature": 0}  # 阅卷要稳定，同一份卷子多次评分应一致
+            if 'siliconflow' in base_url:
+                data["enable_thinking"] = False   # 硅基流动上的混合思考模型：关掉思考，快很多
             headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
                        "User-Agent": "ZhixueGrader/1.0"}
 
-            last = None
-            for attempt in range(2):   # 超时 / 服务繁忙时自动重试一次
+            last, retried = None, False
+            for _ in range(3):
                 try:
-                    content = post_chat_stream(url, data, headers)
+                    content = post_chat_stream(url, data, headers, log=self.log)
                     return self.parse_json_result(content) if need_json else content
                 except urllib.error.HTTPError as e:
-                    last = Exception(f"API Error {e.code}: {e.read().decode('utf-8', 'ignore')[:300]}")
+                    msg = e.read().decode('utf-8', 'ignore')[:300]
+                    if e.code == 400 and data.pop("enable_thinking", None) is not None:
+                        continue   # 这个模型不认 enable_thinking，去掉再试
+                    last = Exception(f"API Error {e.code}: {msg}")
                 except Exception as e:
-                    last = Exception(f"API Call Failed: {e}") if 'API' not in str(e) else e
-                if attempt == 0 and is_retryable(last):
+                    last = e if str(e).startswith(("API", "模型")) else Exception(f"API Call Failed: {e}")
+                if not retried and is_retryable(last):   # 超时 / 服务繁忙时自动重试一次
+                    retried = True
                     self.log(f"  ⚠ {last}，5 秒后重试一次…")
                     time.sleep(5)
                     continue
