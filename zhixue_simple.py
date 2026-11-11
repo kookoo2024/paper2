@@ -62,7 +62,7 @@ GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 HTTP_TIMEOUT = 120  # 秒：连续这么久收不到任何数据才算超时（流式接收，长回答不会被误判）
 
 # ================= 在线更新 =================
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.5.0"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -424,44 +424,30 @@ def parse_rubric(text):
 
 
 def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, half_point):
+    """批改提示词：一次请求，看图直接判分。写得短而明确，模型输出也短，一份几秒出结果。"""
     rubric = parse_rubric(rubric_text)
     if rubric:
         rows = "\n".join(f"{i+1}. {p}（{fmt_score(v) if v is not None else '?'}分）" for i, (p, v) in enumerate(rubric))
-        rubric_part = f"【给分点】（老师给定，必须逐条按此判，不得增删）：\n{rows}"
+        rubric_part = f"给分点（按此逐条判，不增不减）：\n{rows}"
     else:
-        rubric_part = (f"【给分点】老师未单独列出。请先根据参考答案中的评分标准拆出给分点，"
-                       f"各点分值之和必须等于满分 {fmt_score(max_score)} 分；参考答案里写了分值的，严格照用。")
+        rubric_part = "给分点：按参考答案中标注的步骤分逐条判；没标分值的，按步骤合理分配，合计等于满分。"
     step = "0.5" if half_point else "1"
-    return f"""你是经验丰富、公正严谨的高中阅卷老师。图片是一名学生对第 {question_num} 题的作答。
+    return f"""你是高中数学阅卷老师。图片是学生第{question_num}题的作答，满分{fmt_score(max_score)}分。
 
-满分：{fmt_score(max_score)} 分
-【参考答案】：
+参考答案：
 {standard_answer}
 
 {rubric_part}
 
-请严格按下面两步做：
-第一步：看清学生写了什么。只认看到的，不要补全、不要纠正；某处字迹实在看不清，就记为【看不清】，绝不猜。
-第二步：逐个给分点判定得分。
-- 学生用了与参考答案不同但正确的方法，按对应步骤等价给分，并把 alt_method 设为 true。
-- 结果正确但关键步骤缺失，只给结果分；过程正确但最后算错，给过程分。
-- 前面一步算错导致后面数值不对、但后面方法正确的，后面的步骤酌情给分。
-- 每个给分点的得分在 0 到该点分值之间，最小单位 {step} 分。
-- 不要因为书写格式、字迹潦草（能看清的）扣分。
+判分要求：
+1. 只按图片里看得到的内容判，不替学生补步骤；字迹看不清影响判分时 unclear 填 true。
+2. 每个给分点：对了给满，错了或没写给0，部分对酌情给分，最小单位{step}分。
+3. 方法和参考答案不同但正确，同样给分，alt_method 填 true。
+4. 前一步错导致后面数值错、但后面方法对，后面酌情给分；只有结果没有过程，只给结果分。
+5. 不因书写潦草（能看清的）或格式扣分。
 
-只返回 JSON，字段顺序如下：
-{{
-  "transcription": "学生关键步骤和最终结果的简要摘录，不超过60字，看不清处写【看不清】",
-  "items": [
-    {{"point": "给分点内容", "full": 该点分值, "got": 学生该点得分, "reason": "理由，15字以内"}}
-  ],
-  "score": 各点得分之和,
-  "confidence": "高 或 中 或 低（对识别和判分的把握）",
-  "unclear": 是否有影响判分的看不清之处(true/false),
-  "alt_method": 是否用了参考答案以外的解法(true/false),
-  "analysis": "评语，20字以内"
-}}
-回答要简短，不要输出 JSON 以外的任何内容。"""
+直接输出 JSON，不要任何别的文字，reason 不超过12字：
+{{"items":[{{"point":"给分点","full":分值,"got":得分,"reason":"理由"}}],"score":总分,"confidence":"高/中/低","unclear":false,"alt_method":false,"analysis":"一句话评语"}}"""
 
 
 def settle_score(result, max_score, half_point):
@@ -1218,15 +1204,9 @@ class SimpleGradingUI:
             model_name = self.config.get('model_name', 'Unknown')
             st = dict(STATS)
             if st.get('t0'):
-                first = st.get('first')
-                msg = f"  ⏱ 共 {elapsed:.1f} 秒（等第一个字 {first:.1f} 秒" if first is not None else f"  ⏱ 共 {elapsed:.1f} 秒（"
-                msg += f"，输出 {st.get('chars', 0)} 字"
-                if st.get('think'):
-                    msg += f"，另外思考了 {st['think']} 字"
-                self.log(msg + f"）· {model_name}")
+                self.log(f"  ⏱ {elapsed:.1f} 秒（其中模型 {time.time() - st['t0']:.1f} 秒，回答 {st.get('chars', 0)} 字）· {model_name}")
             if elapsed > 20:
-                self.log("  ⚠ 这一份超过 20 秒，模型偏慢。" + ("它在“思考”，建议换非思考模型。" if st.get('think') else
-                         "可在「模型」里换 gemini-2.5-flash / Qwen2.5-VL 这类快速识图模型。"))
+                self.log("  ⚠ 这一份超过 20 秒，主要是模型本身慢（可能开着“思考”），可在「模型」里换一个快的识图模型。")
             self.root.after(0, lambda: self.display_result(result, max_score, elapsed, model_name))
             
         except Exception as e:
@@ -1321,10 +1301,17 @@ class SimpleGradingUI:
              if provider == 'Gemini' and not api_key:
                  api_key = DEFAULT_CONFIG['api_key']
         
+        STATS.clear()
         if provider == 'Gemini':
-            # 走 Gemini 的 OpenAI 兼容接口：可以关掉思考、流式接收、统一计时和重试
-            base_url = GEMINI_OPENAI_URL
-            model_name = model_name or 'gemini-2.5-flash'
+            # 和原版一样：用官方库，把图片和提示词一次发过去
+            if not hasattr(self, 'model'):
+                self.init_model()
+            t0 = time.time()
+            response = self.model.generate_content([prompt, image], generation_config={"temperature": 0},
+                                                   request_options={"timeout": HTTP_TIMEOUT})
+            text = response.text
+            STATS.update(t0=t0, chars=len(text))
+            return self.parse_json_result(text) if need_json else text
 
         if True:
             # 智能检测：如果模型不支持 Vision (如 DeepSeek-V3/Chat)，且在 SiliconFlow，则使用 Qwen-VL "借眼"
@@ -1382,7 +1369,9 @@ class SimpleGradingUI:
             last, retried = None, False
             for _ in range(3):
                 try:
-                    content = post_chat_stream(url, data, headers, log=self.log)
+                    t0 = time.time()
+                    content = post_chat_plain(url, data, headers)
+                    STATS.update(t0=t0, chars=len(content))
                     return self.parse_json_result(content) if need_json else content
                 except urllib.error.HTTPError as e:
                     msg = e.read().decode('utf-8', 'ignore')[:300]
