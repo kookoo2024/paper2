@@ -1,9 +1,9 @@
 {
   "version": "1.7.3",
-  "notes": "v1.7.3：给分点不再截断，按你给的评分标准严格逐条对照；等价解法（切点弦/极点极线）不再误判 0 分；自动裁掉截图底部任务栏；三次判分取中位数，减少偏松；单份约 9~10 秒。",
+  "notes": "v1.7.3：给分点不再截断，长给分点也能识别，按你给的评分标准严格逐条对照；等价解法（切点弦/极点极线）不再误判 0 分；自动裁掉截图底部任务栏；三次判分取中位数，减少偏松；单份约 9~10 秒。",
   "files": {
-    "zhixue_simple.py": "46d9eb28884bfad2cb1697a56ff1f04d82cbab5ccf5297cf9cb57b9f008e82c5",
-    "README.md": "9b009c722b9604a65aa751db3e6cad075618524fe47afe3ba3d62b088b01e7da",
+    "zhixue_simple.py": "98d1f14d3197dd711a4f8487154223e471ada561f1bb8345c8f51497443825fc",
+    "README.md": "72f4f3a7091432f1f828eec1b6dd35bf56fd2736ae226de72e8a0bb40a9e7d5e",
     "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3"
   }
 }

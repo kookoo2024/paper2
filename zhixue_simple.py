@@ -645,7 +645,8 @@ def default_rubric(answer, max_score):
 
 
 RUBRIC_RULE_WORDS = ("如果", "若", "最多", "至少", "不得", "否则", "只对", "只做",
-                     "没有", "未", "零分", "扣", "缺", "漏", "错", "不能", "只能", "注意", "说明")
+                     "没有", "未", "零分", "扣", "缺", "漏", "错", "不能", "只能", "注意", "说明",
+                     "本题", "参考答案", "满分", "总分", "合计", "共计")
 
 
 def parse_rubric_rules(text, max_score=None):
@@ -672,8 +673,8 @@ def parse_rubric_rules(text, max_score=None):
         if m and m.group(1).strip(" |｜:：,，"):
             scored.append((m.group(1).strip(" |｜:：,，"), float(m.group(2))))
             continue
-        # 2) 没写分隔符：只接受短要点 + 末尾分值，且不能带条件/扣分说明
-        m = re.match(r"^(.{1,20}?)\s*[（(【\[]?\s*(?:得|给)?\s*([0-9]+(?:\.[0-9]+)?)\s*分\s*[)）】\]]?[。；;]?\s*$", line)
+        # 2) 没写分隔符：接受“要点（2分）”，但不能带条件/扣分/汇总说明
+        m = re.match(r"^(.{1,80}?)\s*[（(【\[]?\s*(?:得|给)?\s*([0-9]+(?:\.[0-9]+)?)\s*分\s*[)）】\]]?[。；;]?\s*$", line)
         if m and m.group(1).strip():
             point = m.group(1).strip()
             if not any(w in point for w in RUBRIC_RULE_WORDS):
