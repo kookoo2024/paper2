@@ -153,7 +153,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -704,17 +704,17 @@ def parse_rubric_rules(text, max_score=None):
 
 
 def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, half_point):
-    """批改提示词：一次请求，看图直接判分。写得短而明确，模型输出也短，一份几秒出结果。"""
+    """批改提示词：一次请求，看图直接判分。严格按给定给分点，不自行加码。"""
     rules = parse_rubric_rules(rubric_text, max_score)
     scored = rules["scored"]
     if not scored:
         scored = default_rubric(standard_answer, max_score)
     if scored:
         rows = "\n".join(f"{i+1}. {p}（{fmt_score(v)}分）" for i, (p, v) in enumerate(scored))
-        rubric_part = f"给分点（按此逐条判，不增不减）：\n{rows}"
+        rubric_part = f"给分点（唯一评分依据，不增不减、不改分值）：\n{rows}"
     else:
-        rubric_part = "给分点：按参考答案中标注的步骤分逐条判；没标分值的，按步骤合理分配，合计等于满分。"
-    step = "0.5" if half_point else "1"
+        rubric_part = ("给分点：未提供。按参考答案的解题步骤逐条给分：每条分值按参考答案标注的步骤分，"
+                       "没标注的按步骤在满分内拆分；只给完成了该步骤的分数，不得给步骤之外的分数。")
     return f"""你是高中数学阅卷老师。图片是学生第{question_num}题的作答，满分{fmt_score(max_score)}分。
 
 参考答案：
@@ -722,23 +722,28 @@ def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, 
 
 {rubric_part}
 
-重要：给分点里的中间式只是参考路径，不是必须逐字出现的得分条件。先整体看学生怎么做的；只要方法成立、能推出同一结论，就给该点满分。例如圆外一点作两条切线，直接写 (x₀−a)(x−a)+(y₀−b)(y−b)=r² 求切点弦，是完全正确的方法，不能因为没写“四点共圆、两圆相减”而扣分。
-
-判分要求：
+判分要求（严格执行，不得放宽）：
 1. 只按图片里看得到的内容判，不替学生补步骤；字迹看不清影响判分时 unclear 填 true。
-2. 每个给分点必须严格对照该点文字：写出该点要求的公式、方程或结论才给分；只写相关思路、没算出该点结果，最多给该点一半；该点结论错误不得给满；不因“思路对”给满，不补跳步，最小单位{step}分。
-3. 先判断学生实际用了什么方法，再逐点判。方法和参考答案不同但推理和结论正确，照样给满分，alt_method 填 true；不要因为没出现参考答案的中间式、或步骤顺序不同而扣分。求弦所在直线时，用极点极线、代入消元、两点式等都可以。
-4. 前一步错导致后面数值错、但后面方法对，后面按写出的步骤给分；只有结果没有过程，最多给该点满分的一半；有过程但跳步，按写出的步骤给分，不补跳步。
-5. 不因书写潦草（能看清的）或格式扣分。
-6. items 只列最终给分点，禁止输出“第(1)问合计”“小计”“总分”这类汇总行。
-7. 所有 full 相加必须正好等于 {fmt_score(max_score)} 分；拆不准就少拆几条，绝不能超过满分。
-8. 拿不准是否算完成该点时，按未完成处理；但已经明确写出的正确结论不能被否定。同一处错误只扣一次，不重复扣分。
+2. 逐条对照给分点：学生答案里必须明确写出该点要求的公式、方程或结论（或数学上等价的正确表达），才给该点满分；没看到该得分点、也没有等价表达，或只写相关思路、跳步、该点结论写错的，该点一律记 0 分。严禁酌情给分，不给“思路分”“步骤分”“同情分”，不凑分。
+3. 不得新增、拆分、合并给分点，不得改动每条给分点的分值，也不得在给分点之外额外给分。
+4. 学生用等价解法（如用极点极线直接写切点弦方程），只要确实完成了该给分点要求，按该点给分，alt_method 填 true；等价解法不是加分理由，也不改变分值。
+5. 前一步算错导致后面数值错、但后面步骤本身写对，按该给分点给分；只有结果没有过程，该点记 0 分。
+6. 不因书写潦草（能看清的）或格式扣分。
+7. items 只列上面的给分点，顺序和分值保持原样，禁止输出“第(1)问合计”“小计”“总分”这类汇总行。
+8. 所有 full 相加必须正好等于 {fmt_score(max_score)} 分；score 必须等于 items 中 got 之和，绝不能超过满分。
+9. 拿不准是否完成该点时按未完成处理（记 0 分）；但已经明确写出的正确结论不能被否定。同一处错误只扣一次。
+
+等价判定（双向严格，必须照做）：
+- 等价指学生写出的内容与给分点要求的是同一个数学对象或同一个结论，能通过移项、恒等变形、代入、参数化互相得到。例如：15x−8y−55=0 与 8y=15x−55、y=(15/8)x−55/8 等价；(x−3/2)²+(y+3)²=17/4 与 x²+y²−3x+6y+7=0 等价；用极点极线直接写切点弦，与四点共圆、两圆相减得到同一条直线等价；向量法、坐标法、几何法得到同一结论等价。
+- 等价写法必须按该给分点给满分，不得因形式不同、步骤顺序不同、字母符号不同而扣分或记 0 分。
+- 以下一律不算等价、记 0 分：只写了相关公式或概念但没写出该点结果；只写“由…可得”后面没有结果；结果数值、符号或范围错误；推导与结论无关。
+- 判定方法：先在学生答卷里找到该点要求的最终结果（公式/方程/数值/结论），再判断是否等价；找不到就记 0 分，不要用“他应该会”“思路对”来补。
 
 直接输出 JSON，不要任何别的文字，reason 不超过12字：
 {{"items":[{{"point":"给分点","full":分值,"got":得分,"reason":"理由"}}],"score":总分,"confidence":"高/中/低","unclear":false,"alt_method":false,"analysis":"一句话评语"}}"""
 
 
-def settle_score(result, max_score, half_point, score_cap=None):
+def settle_score(result, max_score, half_point, score_cap=None, expected=None):
     """按给分点加总得到最终分，并返回需要人工复核的原因列表"""
     import math
     import re
@@ -758,6 +763,18 @@ def settle_score(result, max_score, half_point, score_cap=None):
 
     if result.get("blank"):
         return 0, items, reasons
+
+    # 给分点分值以评分标准为准：模型改了分值就强制回填，确保不擅自加码
+    expected = [(str(p), float(v)) for p, v in (expected or [])]
+    if expected and items:
+        if len(items) == len(expected):
+            for it, (_, val) in zip(items, expected):
+                if abs(it["full"] - val) > 1e-9:
+                    reasons.append(f"模型改了给分点分值，已按标准回填 {fmt_score(val)} 分")
+                it["full"] = val
+                it["got"] = max(0.0, min(it["got"], val))
+        else:
+            reasons.append("模型返回的给分点条数与评分标准不一致，请复核")
 
     if items:
         sub_re = re.compile(r"(合计|小计|总分|总计|第\s*[（(]?[一二三1-3][)）]?\s*问\s*合计)")
@@ -795,7 +812,7 @@ def settle_score(result, max_score, half_point, score_cap=None):
 
     total = max(0.0, min(total, float(max_score)))
     unit = 0.5 if half_point else 1.0
-    total = math.floor(total / unit + 0.5 + 1e-9) * unit   # 四舍五入到最小单位
+    total = math.floor(total / unit + 1e-9) * unit   # 向下取整到最小单位，绝不多给
     if score_cap is not None:
         cap = max(0.0, min(float(score_cap), float(max_score)))
         if total > cap + 1e-9:
@@ -953,7 +970,7 @@ class SimpleGradingUI:
         self.saved_rubric = ""        # 给分点（每行：要点｜分值）
         self.half_point = False       # 是否允许 0.5 分
         self.blank_threshold = 0.0015 # 墨迹占比低于此值视为空白卷
-        self.grade_samples = 0        # 0=自动：Magpie/Custom 取 3 次，其它 1 次
+        self.grade_samples = 1        # 已废弃：固定单次判分（字段保留兼容旧配置）
         self.keep_topmost = True      # 是否置顶（批改时可自动临时取消）
         
         self.save_timer = None # 自动保存定时器
@@ -1143,8 +1160,9 @@ class SimpleGradingUI:
                 b = self._btn(slot, text, cmd, T['teal_bg'], fg=T['teal_d'], active='#C3FAE8')
             b.pack(fill=tk.BOTH, expand=True)
 
-        head, inner = panel(0, "参考答案", T['teal'], "含评分标准，可截图识别")
+        head, inner = panel(0, "参考答案", T['teal'], "含评分标准")
         head_btn(head, "清空", lambda: (self.answer_text.delete('1.0', tk.END), self._editor_changed()), False)
+        head_btn(head, "粘贴", self.paste_standard_answer, False)
         head_btn(head, "截图识别", self.capture_standard_answer, True)
         self.answer_text = text_box(inner)
 
@@ -1366,7 +1384,7 @@ class SimpleGradingUI:
         tk.Checkbutton(r, text="连续", variable=self.auto_var, command=self.on_checkbox_changed, **ck).grid(row=0, column=0, sticky='w')
         self.auto_click_var = tk.BooleanVar(value=False)
         tk.Checkbutton(r, text="自动填分", variable=self.auto_click_var, command=self.save_config, **ck).grid(row=0, column=1, sticky='w')
-        self.skip_confirm_var = tk.BooleanVar(value=False)
+        self.skip_confirm_var = tk.BooleanVar(value=True)
         tk.Checkbutton(r, text="跳过确认", variable=self.skip_confirm_var, command=self.save_config,
                        **dict(ck, fg=T['warn'])).grid(row=0, column=2, sticky='w')
 
@@ -1408,7 +1426,7 @@ class SimpleGradingUI:
         self.log("1 框选答题区域  2 填题号/满分/参考答案")
         self.log("3 定位输入框和提交按钮  4 点测试验证")
         self.log("5 勾选连续+自动填分，按空格开始")
-        self.log("不勾跳过确认＝每份弹窗确认（安全）；勾上＝直接提交（高效）。")
+        self.log("默认跳过确认、判完直接提交；需要人工把关时可取消勾选。")
         self.log("鼠标甩到屏幕左上角 = 紧急停止；Esc = 停止。\n")
 
     def update_ui_from_config(self):
@@ -1437,7 +1455,7 @@ class SimpleGradingUI:
         if hasattr(self, 'auto_click_var'):
             self.auto_click_var.set(self.saved_auto_click)
         if hasattr(self, 'skip_confirm_var'):
-            self.skip_confirm_var.set(self.saved_skip_confirm)
+            self.skip_confirm_var.set(getattr(self, 'saved_skip_confirm', True))
         
         # 3. 延时设置
         if self.saved_delay and hasattr(self, 'delay_entry'):
@@ -1477,6 +1495,25 @@ class SimpleGradingUI:
         selector = ScreenshotSelector(on_region_selected)
         selector.start()
     
+    def paste_standard_answer(self):
+        """把剪贴板里的文字粘贴到参考答案末尾（图片请用「截图识别」）"""
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        text = (text or "").strip()
+        if not text:
+            messagebox.showinfo("粘贴", "剪贴板里没有文字。\n如果是图片，请用「截图识别」。", parent=self.editor)
+            return
+        cur = self.answer_text.get('1.0', tk.END).strip()
+        if cur:
+            self.answer_text.insert(tk.END, "\n" + text)
+        else:
+            self.answer_text.insert('1.0', text)
+        self.answer_text.see(tk.END)
+        self._editor_changed()
+        self.log(f"✓ 已粘贴参考答案 {len(text)} 字" + ("（追加）" if cur else ""))
+
     def capture_standard_answer(self):
         """截图参考答案并识别文字（追加到参考答案末尾）"""
         editor_open = self.editor.winfo_viewable()
@@ -1614,7 +1651,7 @@ class SimpleGradingUI:
             if abs(total - mx) > 0.01:
                 if messagebox.askyesno("给分点和满分对不上",
                                        f"给分点合计 {fmt_score(total)} 分，满分是 {fmt_score(mx)} 分。\n\n"
-                                       "点「是」打开编辑窗口修改；点「否」照样批改（每份都会要求人工确认）。"):
+                                       "点「是」打开编辑窗口修改；点「否」照样批改（按现有给分点严格判分，不再逐份确认）。"):
                     self.open_answer_editor()
                     return
 
@@ -1698,11 +1735,13 @@ class SimpleGradingUI:
             else:
                 rubric = self.rubric_text.get('1.0', tk.END).strip()
                 rules = parse_rubric_rules(rubric, max_score_f)
-                if rules["scored"]:
+                expected_points = rules["scored"]
+                if expected_points:
                     self.log(f"  📋 给分点 {len(rules['scored'])} 条，合计 "
                              f"{fmt_score(sum(v for _, v in rules['scored']))} 分")
                 else:
                     derived_scored = default_rubric(standard_answer, max_score_f)
+                    expected_points = derived_scored
                     if derived_scored:
                         vals = [v for _, v in derived_scored]
                         self.log(f"  📋 已从参考答案自动拆出给分点：{' + '.join(str(fmt_score(v)) for v in vals)}")
@@ -1713,45 +1752,15 @@ class SimpleGradingUI:
                     self.log(f"  📏 零分规则 {len(rules['zero_rules'])} 条（请人工复核对应步骤）")
                 prompt = build_grading_prompt(question_num, max_score, standard_answer, rubric,
                                               self.half_point)
-                # 多次取样：单次判分波动大，固定取 3 次，按中位数采用，避免取最高分导致偏松
-                provider = str(self.config.get('provider', '')).lower()
-                default_samples = 3 if provider in ('magpie', 'custom') else 1
-                max_samples = int(getattr(self, 'grade_samples', 0) or default_samples)
-                max_samples = max(1, min(3, max_samples))
-                samples = []
-                target = max_samples
-                deadline = start_time + 18
-                while len(samples) < target:
-                    if samples and time.time() > deadline - 4:
-                        break
-                    try:
-                        r = self.call_ai_api(prompt, grade_img, need_json=True)
-                    except Exception as e:
-                        if samples:
-                            self.log(f"  ⚠ 第 {len(samples) + 1} 次判分失败：{str(e)[:80]}，使用已有结果")
-                            break
-                        raise
-                    s, its, rs = settle_score(r, max_score_f, self.half_point, rules["score_cap"])
-                    r['score'] = s
-                    r['items'] = its
-                    samples.append((s, r, its, rs))
-                    self.log(f"  🧪 第 {len(samples)} 次判分：{fmt_score(s)} 分")
-                if not samples:
-                    raise Exception("模型没有返回可用分数")
-                totals = [x[0] for x in samples]
-                chosen = choose_consensus(samples)
-                score, result, items, reasons = chosen
-                if len(samples) > 1:
-                    method = "中位数" if len(samples) >= 3 else "把握度优先/较低分"
-                    self.log(f"  🧪 多次判分：{'/'.join(str(fmt_score(t)) for t in totals)}"
-                             f" → 采用{method} {fmt_score(score)} 分")
-                    if max(totals) - min(totals) >= 2:
-                        reasons.append(f"多次判分差异较大（{'/'.join(str(fmt_score(t)) for t in totals)}），"
-                                       f"取中位数 {fmt_score(score)}，请复核")
-                if ink > 0.90:
-                    reasons.append(f"截图墨迹占比很高（{ink:.2f}），请确认不是黑屏/遮挡")
+                # 单次判分：严格按评分标准只判一次，不做多次采样
+                result = self.call_ai_api(prompt, grade_img, need_json=True)
+                score, items, reasons = settle_score(result, max_score_f, self.half_point,
+                                                     rules["score_cap"], expected_points)
+                self.log(f"  🧪 判分结果：{fmt_score(score)} 分")
                 result['score'] = score
                 result['items'] = items
+                if ink > 0.90:
+                    reasons.append(f"截图墨迹占比很高（{ink:.2f}），请确认不是黑屏/遮挡")
 
             result['_reasons'] = (reasons or []) + extra_reasons
             result['_ink'] = round(ink, 4)
@@ -1807,7 +1816,7 @@ class SimpleGradingUI:
                 if isinstance(d, dict):
                     detail_text += f"  • {d.get('point', '未命名扣分点')}: -{d.get('deduction', 0)}分\n"
         if reasons:
-            detail_text += "\n⚠ 需人工复核:\n" + "\n".join(f"  • {r}" for r in reasons)
+            detail_text += "\n提示:\n" + "\n".join(f"  • {r}" for r in reasons)
 
         self.current_analysis_label.config(text=f"评语: {analysis}")
         self.log(detail_text)
@@ -1829,7 +1838,7 @@ class SimpleGradingUI:
         self.waiting_for_confirm = True
         self.pending_score = score
         self._raise_window()
-        self.show_confirm_dialog(score, max_score, detail_text, force=bool(reasons))
+        self.show_confirm_dialog(score, max_score, detail_text)
 
     def _save_record(self):
         """在用户确认/改分后保存记录，保证 HTML/笔记里的分数是最终提交分。"""
@@ -2927,7 +2936,7 @@ class SimpleGradingUI:
                 # 加载复选框状态
                 self.saved_auto_continue = config.get('auto_continue', False)
                 self.saved_auto_click = config.get('auto_click', False)
-                self.saved_skip_confirm = config.get('skip_confirm', False)
+                self.saved_skip_confirm = True   # 固定跳过确认：不再逐份人工复核
                 self.saved_delay = config.get('delay', '3')
                 
                 # 加载模型配置
@@ -2980,7 +2989,7 @@ class SimpleGradingUI:
             # 设置默认值
             self.saved_auto_continue = False
             self.saved_auto_click = False
-            self.saved_skip_confirm = False
+            self.saved_skip_confirm = True
             self.saved_delay = '3'
             self.config = DEFAULT_CONFIG.copy()
 
@@ -3045,7 +3054,7 @@ class SimpleGradingUI:
 
             reasons = result.get('_reasons') or []
             if reasons:
-                content += "- **需人工复核**: " + "；".join(str(r) for r in reasons) + "\n"
+                content += "- **提示**: " + "；".join(str(r) for r in reasons) + "\n"
             
             content += f"\n![[{img_filename}]]\n"
             content += "---\n"
@@ -3125,7 +3134,7 @@ class SimpleGradingUI:
                     card_html += f"<li>{d['point']}: <span class='deduction'>-{d['deduction']}</span></li>"
                 card_html += "</ul>"
             if reasons:
-                card_html += "<div class='review'>⚠ 需人工复核：" + escape("；".join(str(r) for r in reasons)) + "</div>"
+                card_html += "<div class='review'>⚠ 提示：" + escape("；".join(str(r) for r in reasons)) + "</div>"
             
             card_html += f"""
                     </div>
