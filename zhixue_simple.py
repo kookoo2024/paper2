@@ -58,6 +58,79 @@ PROVIDERS = {
 
 HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
 
+# ================= 在线更新 =================
+APP_VERSION = "1.1.0"
+UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
+UPDATE_BRANCH = "main"
+# 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
+UPDATE_SOURCES = [
+    "https://raw.githubusercontent.com/{repo}/{branch}/",
+    "https://cdn.jsdelivr.net/gh/{repo}@{branch}/",
+]
+
+
+def _ver_tuple(v):
+    out = []
+    for part in str(v).strip().lstrip("vV").split("."):
+        num = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(num) if num else 0)
+    return tuple(out + [0] * (3 - len(out)))
+
+
+def check_update(custom_base=""):
+    """返回 (有新版本?, 远程信息dict, 使用的base地址)。远程 version.json 格式：
+    {"version": "1.2.0", "notes": "更新说明", "files": {"zhixue_simple.py": "<sha256>", ...}}"""
+    import urllib.request
+    bases = [custom_base] if custom_base else [b.format(repo=UPDATE_REPO, branch=UPDATE_BRANCH) for b in UPDATE_SOURCES]
+    last_err = None
+    for base in bases:
+        try:
+            url = base.rstrip("/") + "/version.json?t=" + str(int(time.time()))
+            req = urllib.request.Request(url, headers={"User-Agent": f"ZhixueGrader/{APP_VERSION}", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                info = json.loads(r.read().decode("utf-8-sig"))
+            return _ver_tuple(info.get("version", "0")) > _ver_tuple(APP_VERSION), info, base
+        except Exception as e:
+            last_err = e
+    raise Exception(f"无法连接更新服务器：{last_err}")
+
+
+def apply_update(info, base):
+    """下载 version.json 列出的文件，校验后替换；旧文件备份到 backup/ 目录。返回更新的文件列表"""
+    import os, hashlib, shutil, urllib.request
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    files = info.get("files") or {"zhixue_simple.py": ""}
+    if isinstance(files, list):
+        files = {f: "" for f in files}
+    staged = {}
+    for name, sha in files.items():
+        if ".." in name or os.path.isabs(name) or name.endswith("config.json"):
+            continue  # 安全：不允许写到程序目录之外，也绝不覆盖用户配置
+        req = urllib.request.Request(base.rstrip("/") + "/" + name + "?t=" + str(int(time.time())),
+                                     headers={"User-Agent": f"ZhixueGrader/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+        if sha and hashlib.sha256(data).hexdigest().lower() != sha.lower():
+            raise Exception(f"{name} 校验失败（可能镜像还没同步），已取消更新，原文件未改动")
+        if name.endswith(".py"):
+            compile(data.decode("utf-8"), name, "exec")  # 语法检查，坏文件不替换
+        staged[name] = data
+    if not staged:
+        raise Exception("更新清单为空")
+    bdir = os.path.join(app_dir, "backup", f"v{APP_VERSION}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    os.makedirs(bdir, exist_ok=True)
+    for name, data in staged.items():
+        dst = os.path.join(app_dir, name)
+        if os.path.exists(dst):
+            os.makedirs(os.path.dirname(os.path.join(bdir, name)), exist_ok=True)
+            shutil.copy2(dst, os.path.join(bdir, name))
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        tmp = dst + ".new"
+        with open(tmp, "wb") as fp:
+            fp.write(data)
+        os.replace(tmp, dst)  # 原子替换
+    return list(staged), bdir
+
 
 def http_open(req, timeout=HTTP_TIMEOUT):
     """本机地址（magpie/Ollama）绕过系统代理，避免 v2rayN 等全局代理把 127.0.0.1 也转发出去"""
@@ -204,15 +277,20 @@ class ScreenshotSelector:
 class SimpleGradingUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("知学网阅卷助手 - 大题批改")
+        # 线程安全的界面更新队列：后台线程只往队列里放函数，由主线程执行
+        import queue
+        self._uiq = queue.Queue()
+        self._main_thread = threading.current_thread()
+        self.root.title(f"知学网阅卷助手 v{APP_VERSION}")
         
         self.root.geometry("270x700")
         self.root.resizable(False, False)  # 固定大小
         self.root.attributes('-topmost', True)  # 窗口置顶
 
         
-        self.config_file = 'zhixue_simple_config.json'
-        self.config_file = 'zhixue_simple_config.json'
+        # 配置文件固定放在程序目录（双击运行或从别的目录启动都能找到）
+        import os
+        self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zhixue_simple_config.json')
 
         self.answer_region = None
         self.grading_count = 0
@@ -241,6 +319,12 @@ class SimpleGradingUI:
         self.create_widgets()  # 创建界面
         self.update_ui_from_config()  # 更新界面显示
         
+        self.root.after(50, self._drain_ui_queue)
+
+        # 启动 3 秒后静默检查更新（有新版本才提示）
+        if self.config.get('auto_check_update', True):
+            self.root.after(3000, lambda: self.check_update_ui(silent=True))
+
         self.root.bind('<space>', lambda e: self.grade_answer())
         self.root.bind('<Escape>', lambda e: self.stop_grading())
         
@@ -261,8 +345,8 @@ class SimpleGradingUI:
         
         tk.Label(
             title_frame, 
-            text="大题批改助手", 
-            font=('微软雅黑', 12, 'bold'),
+            text=f"阅卷助手 v{APP_VERSION}", 
+            font=('微软雅黑', 10, 'bold'),
             bg='#2196F3',
             fg='white'
         ).pack(side=tk.LEFT, padx=10, pady=10)
@@ -279,6 +363,19 @@ class SimpleGradingUI:
             cursor='hand2'
         ).pack(side=tk.RIGHT, padx=10, ipadx=5, ipady=2)
         
+        # 在线更新按钮
+        self.update_btn = tk.Button(
+            title_frame,
+            text="⬆",
+            command=lambda: self.check_update_ui(silent=False),
+            bg='#1565C0',
+            fg='white',
+            font=('微软雅黑', 8),
+            bd=0,
+            cursor='hand2'
+        )
+        self.update_btn.pack(side=tk.RIGHT, padx=(0, 4), ipadx=3, ipady=2)
+
         # Obsidian 设置按钮
         tk.Button(
             title_frame,
@@ -756,8 +853,10 @@ class SimpleGradingUI:
             self.root.after(0, lambda: self.display_result(result, max_score, elapsed, model_name))
             
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"❌ 批改失败: {str(e)}"))
-            self.root.after(0, lambda: messagebox.showerror("错误", f"批改失败：{str(e)}"))
+            err = str(e)
+            self.log(f"❌ 批改失败: {err}")
+            self.ui(self.stop_grading)  # 自动连续模式下出错要停下，不能卡在“批改中”
+            self.ui(lambda: messagebox.showerror("错误", f"批改失败：{err}"))
         
         finally:
             # 只在非自动连续模式下重置状态
@@ -803,12 +902,22 @@ class SimpleGradingUI:
         # 自动保存为 HTML
         self.save_to_html(result, max_score, self.current_student_img, model_name, elapsed, avg_time)
         
+        # 自检：扣分合计应等于 满分-得分；对不上说明模型自相矛盾，强制人工确认
+        try:
+            ded_sum = sum(float(d.get('deduction', 0) or 0) for d in deductions)
+        except (TypeError, ValueError, AttributeError):
+            ded_sum = None
+        need_review = ded_sum is None or abs((max_score - ded_sum) - score) > 0.01
+        if need_review:
+            detail_text = f"⚠ 扣分合计({ded_sum})与得分对不上，请人工核对！\n\n" + detail_text
+            self.log("⚠ 扣分合计与得分不一致，本份强制人工确认")
+
         # 设置等待确认状态
         self.waiting_for_confirm = True
         self.pending_score = score
         
         # 弹出确认对话框
-        self.show_confirm_dialog(score, max_score, detail_text)
+        self.show_confirm_dialog(score, max_score, detail_text, force=need_review)
 
     def init_model(self):
         """初始化模型"""
@@ -1251,11 +1360,15 @@ class SimpleGradingUI:
         if not messagebox.askokcancel("测试自动点击", msg):
             return
         
-        self.log("\n🧪 开始测试自动点击...")
-        time.sleep(3)
-        
-        result = self.auto_click_score(test_score)
-        
+        self.log("\n🧪 3秒后开始测试自动点击...")
+
+        def worker():
+            time.sleep(3)
+            ok = self.auto_click_score(test_score)
+            self.ui(lambda: self._test_done(ok))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _test_done(self, result):
         if result:
             messagebox.showinfo("测试成功", f"自动点击测试成功！\n\n请检查：\n1. 分数是否输入到输入框\n2. 提交按钮是否被点击\n\n如果成功，可以开始使用自动批改功能")
         else:
@@ -1287,15 +1400,17 @@ class SimpleGradingUI:
             self.pause_btn.config(text="⏸ 暂停", bg='#2196F3')
             self.log("▶ 继续批改\n")
     
-    def show_confirm_dialog(self, score, max_score, detail_text):
-        """显示确认对话框"""
+    def show_confirm_dialog(self, score, max_score, detail_text, force=False):
+        """显示确认对话框；force=True 时即使勾选了“跳过确认”也要人工确认"""
         # 如果勾选了跳过确认，直接自动提交
-        if self.skip_confirm_var.get():
+        if self.skip_confirm_var.get() and not force:
             self.log(f"⚡ 跳过确认，直接提交分数: {score}")
             if self.auto_click_var.get():
-                self.auto_click_score(score)
+                self.submit_score_async(score)
             else:
                 self.log(f"⚠ 自动点击未开启，请手动输入分数")
+                self.is_grading = False
+                self.grade_btn.config(state=tk.NORMAL, text="🚀 批改 (空格)")
             self.waiting_for_confirm = False
             self.pending_score = None
             return
@@ -1357,9 +1472,11 @@ class SimpleGradingUI:
             # 如果开启自动点击
             if self.auto_click_var.get():
                 self.log(f"🤖 自动点击已开启，开始自动提交...")
-                self.auto_click_score(self.pending_score)
+                self.submit_score_async(self.pending_score)
             else:
                 self.log(f"⚠ 自动点击未开启，请手动输入分数")
+                self.is_grading = False
+                self.grade_btn.config(state=tk.NORMAL, text="🚀 批改 (空格)")
             
             self.waiting_for_confirm = False
             self.pending_score = None
@@ -1407,14 +1524,19 @@ class SimpleGradingUI:
         # 聚焦到接受按钮
         accept_btn.focus_set()
     
+    def submit_score_async(self, score):
+        """在后台线程里自动输入分数并提交，界面不再卡住，暂停/停止按钮随时可点"""
+        threading.Thread(target=self.auto_click_score, args=(score,), daemon=True).start()
+
     def auto_click_score(self, score):
-        """自动输入分数并提交"""
+        """自动输入分数并提交（在后台线程运行）"""
         score = float(score)
         score = int(score) if score == int(score) else score  # 支持 0.5 分
         
         if not self.score_input_box or not self.submit_button_pos:
             self.log("⚠ 未设置自动提交位置")
-            messagebox.showwarning("提示", "未设置自动提交位置\n请点击'⚙ 设置按钮'")
+            self.ui(lambda: messagebox.showwarning("提示", "未设置自动提交位置\n请点击'⚙ 设置按钮'"))
+            self.ui(self.stop_grading)
             return False
         
         try:
@@ -1479,14 +1601,15 @@ class SimpleGradingUI:
                 next_delay = 1 if self.skip_confirm_var.get() else 2
                 self.log(f"⏱ {next_delay}秒后批改下一个学生...")
                 
-                # 等待时检查暂停状态
+                # 等待时检查暂停状态（后台线程里等，界面照常响应）
                 for i in range(int(next_delay * 10)):
                     if self.is_paused:
                         self.log(f"⏸ 已暂停，等待继续...")
-                        # 等待继续
-                        while self.is_paused:
+                        while self.is_paused and self.auto_continue:
                             time.sleep(0.1)
                         self.log(f"▶ 继续批改...")
+                        break
+                    if not self.auto_continue:
                         break
                     time.sleep(0.1)
                 
@@ -1494,19 +1617,23 @@ class SimpleGradingUI:
                 self.is_grading = False
                 self.waiting_for_confirm = False
                 self.pending_score = None
-                self.log(f"✓ 状态已重置，开始批改下一个...\n")
-                self.root.after(100, self.grade_answer)  # 使用after避免阻塞
+                if self.auto_continue:  # 等待期间可能按了停止
+                    self.log(f"✓ 开始批改下一个...\n")
+                    self.ui(self.grade_answer)
             else:
                 self.log(f"✓ 自动提交完成\n")
-                # 禁用暂停按钮
-                self.root.after(0, lambda: self.pause_btn.config(state=tk.DISABLED))
+                self.is_grading = False
+                self.ui(lambda: self.pause_btn.config(state=tk.DISABLED))
+                self.ui(lambda: self.grade_btn.config(state=tk.NORMAL, text="🚀 批改 (空格)"))
             
             return True
         except Exception as e:
             self.log(f"❌ 自动提交失败: {str(e)}")
             import traceback
             self.log(traceback.format_exc())
-            messagebox.showerror("错误", f"自动提交失败：{str(e)}\n\n请检查：\n1. 是否正确设置了位置\n2. 阅卷窗口是否可见\n3. 输入框是否可编辑")
+            err = str(e)
+            self.ui(self.stop_grading)
+            self.ui(lambda: messagebox.showerror("错误", f"自动提交失败：{err}\n\n请检查：\n1. 是否正确设置了位置\n2. 阅卷窗口是否可见\n3. 输入框是否可编辑\n（鼠标甩到屏幕左上角会触发紧急停止）"))
             return False
     
     def stop_grading(self):
@@ -1525,11 +1652,96 @@ class SimpleGradingUI:
         eff = int(3600 / avg) if avg > 0 else 0
         self.stats_label.config(text=f"已批改: {self.grading_count} | 用时: {self.total_time:.0f}s | 平均: {avg:.1f}s | 效率: {eff}/h")
     
+    def ui(self, fn):
+        """在主线程执行 fn（后台线程调用界面一律走这里）"""
+        if threading.current_thread() is self._main_thread:
+            fn()
+        else:
+            self._uiq.put(fn)
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn = self._uiq.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    print("UI 回调出错:", e)
+        except Exception:
+            pass
+        self.root.after(50, self._drain_ui_queue)
+
     def log(self, message):
-        """输出日志"""
-        self.result_text.insert(tk.END, message + "\n")
-        self.result_text.see(tk.END)
-        self.root.update()
+        """输出日志（任何线程都可以调用）"""
+        def _do():
+            if not hasattr(self, 'result_text'):
+                print(message)
+                return
+            self.result_text.insert(tk.END, message + "\n")
+            self.result_text.see(tk.END)
+        self.ui(_do)
+
+    # ================= 在线更新 =================
+    def check_update_ui(self, silent=False):
+        import sys
+        if getattr(sys, 'frozen', False):
+            if not silent:
+                messagebox.showinfo("在线更新", "当前是打包版 exe，请到 GitHub 下载新版本。")
+            return
+        if self.is_grading and not silent:
+            messagebox.showwarning("在线更新", "正在批改，请先停止再更新")
+            return
+        self.ui(lambda: self.update_btn.config(state=tk.DISABLED, text="…"))
+
+        def worker():
+            try:
+                has_new, info, base = check_update(self.config.get('update_url', ''))
+            except Exception as e:
+                if not silent:
+                    err = str(e)
+                    self.ui(lambda: messagebox.showerror("在线更新", err))
+                else:
+                    self.log(f"（检查更新失败：{e}）")
+                self.ui(lambda: self.update_btn.config(state=tk.NORMAL, text="⬆"))
+                return
+            self.ui(lambda: self.update_btn.config(state=tk.NORMAL, text="⬆"))
+            if not has_new:
+                if not silent:
+                    self.ui(lambda: messagebox.showinfo("在线更新", f"已是最新版本 v{APP_VERSION}"))
+                return
+            if silent:
+                self.ui(lambda: self.update_btn.config(text="⬆新", bg='#E53935'))
+            self.ui(lambda: self._ask_and_update(info, base))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ask_and_update(self, info, base):
+        if self.is_grading:
+            self.log(f"🔔 发现新版本 v{info.get('version')}，批改结束后点 ⬆ 更新")
+            return
+        msg = f"发现新版本 v{info.get('version')}（当前 v{APP_VERSION}）\n\n{info.get('notes', '')}\n\n现在更新并重启？\n（旧文件会备份到 backup 文件夹，配置不受影响）"
+        if not messagebox.askyesno("在线更新", msg):
+            return
+        self.log("⬇ 正在下载更新...")
+
+        def worker():
+            try:
+                files, bdir = apply_update(info, base)
+            except Exception as e:
+                err = str(e)
+                self.ui(lambda: messagebox.showerror("更新失败", err))
+                return
+            self.log(f"✓ 已更新 {', '.join(files)}，备份在 {bdir}")
+            self.ui(self._restart)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _restart(self):
+        import sys, os, subprocess
+        self.save_config()
+        messagebox.showinfo("更新完成", "更新完成，程序将重新启动。")
+        subprocess.Popen([sys.executable] + sys.argv, cwd=os.getcwd())
+        self.root.destroy()
     
     def schedule_save(self, event=None):
         """防抖自动保存"""

@@ -62,6 +62,15 @@ python zhixue_simple.py
 2. 本程序点「模型设置」→ 提供商选 **Magpie** → 自动检测并获取模型列表
 3. 选一个能识图的模型 → 保存。API Key 默认 `magpie-zhixue`（本机任意值都行，用来在 magpie 的 Usage 里区分本程序的调用）
 
+## 在线更新
+
+- 程序启动 3 秒后会静默检查一次，有新版本时右上角 ⬆ 变红「⬆新」；也可以随时点 ⬆ 手动检查
+- 更新源：GitHub 原始地址，连不上自动换 jsDelivr 镜像；可在配置里加 `"update_url": "你的地址/"` 改成自己的服务器
+- 只下载 `version.json` 里列出的文件，逐个校验 sha256 和语法，**绝不覆盖你的配置文件**；旧文件备份在 `backup/` 文件夹
+- 不想自动检查：配置里加 `"auto_check_update": false`
+
+**发布新版本**（开发者）：改 `APP_VERSION` → 运行 `python make_release.py` 重新生成 `version.json` → 提交推送到 main。
+
 ## 快捷键
 
 - `空格` - 开始批改
