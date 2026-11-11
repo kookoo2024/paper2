@@ -59,7 +59,7 @@ PROVIDERS = {
 HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
 
 # ================= 在线更新 =================
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -414,7 +414,7 @@ class SimpleGradingUI:
         self._main_thread = threading.current_thread()
         self.root.title(f"阅卷 V{APP_VERSION}")
         
-        self.root.geometry("300x880")
+        self.root.geometry("300x800")
         self.root.resizable(False, True)  # 宽度固定，高度可拖（小屏幕可以拉矮）
         self.root.attributes('-topmost', True)  # 窗口置顶
 
@@ -459,12 +459,19 @@ class SimpleGradingUI:
         if self.config.get('auto_check_update', True):
             self.root.after(3000, lambda: self.check_update_ui(silent=True))
 
-        self.root.bind('<space>', lambda e: self.grade_answer())
+        self.root.bind('<space>', self._on_space)
         self.root.bind('<Escape>', lambda e: self.stop_grading())
         
         # 绑定关闭事件，确保存储
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
+    def _on_space(self, event):
+        # 在输入框里打空格时不触发批改
+        if isinstance(event.widget, (tk.Entry, tk.Text)):
+            return
+        self.grade_answer()
+        return "break"
+
     def on_closing(self):
         """窗口关闭时调用"""
         self.save_config()
@@ -472,27 +479,30 @@ class SimpleGradingUI:
     
     # ---------- 界面样式 ----------
     THEME = {
-        'bg': '#EEF2FF',        # 窗口底色（淡紫蓝）
-        'card': '#FFFFFF',      # 卡片
-        'line': '#DDE3F5',      # 描边
-        'text': '#22223B',      # 正文
-        'sub': '#6B6F8E',       # 次要文字
-        'head': '#5B5FEF',      # 顶栏 / 底栏（亮靛蓝）
-        'head2': '#7B7FFF',     # 顶栏按钮
-        'badge': '#FFD23F',     # 版本标签（明黄）
+        'bg': '#EEF6FB',        # 窗口底色（淡天蓝）
+        'card': '#FFFFFF',
+        'line': '#D9E6EF',
+        'text': '#1F2D3A',
+        'sub': '#5F7385',
+        'head': '#1C7ED6',      # 顶栏 / 底栏（亮蓝）
+        'head2': '#4DABF7',     # 顶栏按钮
+        'head_a': '#1971C2',    # 顶栏按钮按下
+        'badge': '#FFD43B',     # 版本标签（明黄）
         'primary': '#FF6B35',   # 批改主按钮（活力橙）
         'primary_d': '#E8551F',
-        'cyan': '#00B8D9',      # ① 答题区域
-        'purple': '#8B5CF6',    # ② 题目 / 暂停
+        'cyan': '#15AABF',      # ① 答题区域
+        'teal': '#12B886',      # ② 题目（翠绿）
+        'teal_d': '#0CA678',
+        'teal_bg': '#E6FCF5',
         'orange': '#FF6B35',    # ③ 批改
-        'green': '#10C98F',     # ④ 结果
-        'ok': '#10B981',
-        'ok_bg': '#E7FBF3',
-        'warn': '#FF8A00',
-        'danger': '#FF3D71',
-        'slate': '#8B5CF6',     # 暂停按钮
-        'tint': '#FFF3EC',      # 分数卡底色（浅橙）
-        'input': '#F7F8FF',     # 输入框
+        'green': '#228BE6',     # ④ 结果（蓝）
+        'ok': '#2FB344',
+        'ok_bg': '#EBFBEE',
+        'warn': '#FD7E14',
+        'danger': '#FA5252',
+        'slate': '#12B886',     # 暂停按钮（翠绿）
+        'tint': '#FFF4E6',      # 分数卡底色（浅橙）
+        'input': '#F8FBFD',
     }
     FONT = '微软雅黑'
     GRADE_TEXT = "▶ 开始批改"
@@ -555,6 +565,167 @@ class SimpleGradingUI:
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(2, 10))
         return head, body
 
+    # ---------- 参考答案 / 给分点 编辑窗口 ----------
+    def build_answer_editor(self):
+        T, F = self.THEME, self.FONT
+        win = tk.Toplevel(self.root)
+        self.editor = win
+        win.withdraw()
+        win.title("参考答案与给分点")
+        win.configure(bg=T['bg'])
+        win.minsize(760, 520)
+        win.protocol("WM_DELETE_WINDOW", self.close_answer_editor)
+        win.bind('<Escape>', lambda e: self.close_answer_editor())
+        win.bind('<Control-s>', lambda e: self.close_answer_editor())
+
+        top = tk.Frame(win, bg=T['teal'], height=46)
+        top.pack(fill=tk.X)
+        top.pack_propagate(False)
+        self.editor_title = tk.Label(top, text="", font=(F, 13, 'bold'), bg=T['teal'], fg='white')
+        self.editor_title.pack(side=tk.LEFT, padx=16)
+        s = tk.Frame(top, bg=T['teal'], width=120, height=30)
+        s.pack_propagate(False)
+        s.pack(side=tk.RIGHT, padx=12)
+        self._btn(s, "保存并关闭", self.close_answer_editor, 'white', fg=T['teal_d'], active=T['teal_bg'],
+                  bold=True).pack(fill=tk.BOTH, expand=True)
+        tk.Label(top, text="Ctrl+S 保存 · Esc 关闭 · 改动自动保存", font=(F, 8), bg=T['teal'],
+                 fg='#E6FCF5').pack(side=tk.RIGHT, padx=6)
+
+        body = tk.Frame(win, bg=T['bg'], padx=12, pady=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.grid_columnconfigure(0, weight=3, uniform='ed')
+        body.grid_columnconfigure(1, weight=2, uniform='ed')
+        body.grid_rowconfigure(0, weight=1)
+
+        def panel(col, title, color, hint):
+            outer = tk.Frame(body, bg=T['card'], highlightthickness=1, highlightbackground=T['line'])
+            outer.grid(row=0, column=col, sticky='nsew', padx=(0, 10) if col == 0 else 0)
+            head = tk.Frame(outer, bg=T['card'], height=34)
+            head.pack_propagate(False)
+            head.pack(fill=tk.X, padx=12, pady=(6, 0))
+            tk.Frame(head, bg=color, width=5, height=16).pack(side=tk.LEFT, padx=(0, 8))
+            tk.Label(head, text=title, font=(F, 11, 'bold'), bg=T['card'], fg=color).pack(side=tk.LEFT)
+            tk.Label(head, text=hint, font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT, padx=(8, 0))
+            inner = tk.Frame(outer, bg=T['card'])
+            inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 12))
+            return head, inner
+
+        def text_box(parent):
+            t = scrolledtext.ScrolledText(parent, font=(F, 12), wrap=tk.WORD, relief=tk.FLAT, bg=T['input'],
+                                          fg=T['text'], highlightthickness=1, highlightbackground=T['line'],
+                                          highlightcolor=T['teal'], insertbackground=T['text'], padx=8, pady=6,
+                                          undo=True)
+            t.pack(fill=tk.BOTH, expand=True)
+            return t
+
+        def head_btn(head, text, cmd, solid):
+            slot = tk.Frame(head, bg=T['card'], width=72, height=26)
+            slot.pack_propagate(False)
+            slot.pack(side=tk.RIGHT, padx=(6, 0))
+            if solid:
+                b = self._btn(slot, text, cmd, T['teal'], active=T['teal_d'])
+            else:
+                b = self._btn(slot, text, cmd, T['teal_bg'], fg=T['teal_d'], active='#C3FAE8')
+            b.pack(fill=tk.BOTH, expand=True)
+
+        head, inner = panel(0, "参考答案", T['teal'], "含评分标准，可截图识别")
+        head_btn(head, "清空", lambda: (self.answer_text.delete('1.0', tk.END), self._editor_changed()), False)
+        head_btn(head, "截图识别", self.capture_standard_answer, True)
+        self.answer_text = text_box(inner)
+
+        head, inner = panel(1, "给分点", T['orange'], "每行：要点｜分值")
+        head_btn(head, "清空", lambda: (self.rubric_text.delete('1.0', tk.END), self._editor_changed()), False)
+        head_btn(head, "从答案提取", self.extract_rubric_from_answer, True)
+        self.rubric_text = text_box(inner)
+        self.rubric_status = tk.Label(inner, text="", font=(F, 10, 'bold'), bg=T['card'], anchor='w', pady=6)
+        self.rubric_status.pack(fill=tk.X)
+        tk.Label(inner, text="不填也行：AI 会先从参考答案里拆出给分点。\n例：求出斜率 k=2｜2分", font=(F, 8),
+                 bg=T['card'], fg=T['sub'], justify=tk.LEFT, anchor='w').pack(fill=tk.X)
+
+        for w in (self.answer_text, self.rubric_text):
+            w.bind('<KeyRelease>', lambda e: self._editor_changed())
+            w.bind('<FocusOut>', lambda e: self._editor_changed())
+
+    def _editor_changed(self):
+        self.save_question_data()
+        self.refresh_answer_summary()
+
+    def open_answer_editor(self):
+        win = self.editor
+        self.refresh_answer_summary()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = min(1100, int(sw * 0.75)), min(760, int(sh * 0.8))
+        if not getattr(self, '_editor_placed', False):
+            win.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - 30)}")
+            self._editor_placed = True
+        win.deiconify()
+        win.attributes('-topmost', True)
+        win.lift()
+        win.focus_force()
+        self.answer_text.focus_set()
+
+    def close_answer_editor(self):
+        self.save_config()
+        self.refresh_answer_summary()
+        self.editor.withdraw()
+
+    def extract_rubric_from_answer(self):
+        """从参考答案里把「……（2分）」这类写了分值的行提取成给分点"""
+        import re
+        found = []
+        for line in self.answer_text.get('1.0', tk.END).splitlines():
+            line = line.strip()
+            m = re.search(r"^(.*?)[\s，,。；;]*[（(【\[]?\s*(?:得|给)?\s*([0-9]+(?:\.[0-9]+)?)\s*分\s*[)）】\]]?[。；;]?$", line)
+            if m and m.group(1).strip():
+                point = m.group(1).strip().rstrip(" .…·")
+                if len(point) > 40:
+                    point = point[:40] + "…"
+                found.append(f"{point}｜{m.group(2)}")
+        if not found:
+            messagebox.showinfo("从答案提取", "参考答案里没找到写了分值的行（如「……（2分）」）。\n可以手动填，或者不填让 AI 自己拆。", parent=self.editor)
+            return
+        if self.rubric_text.get('1.0', tk.END).strip():
+            if not messagebox.askyesno("从答案提取", f"找到 {len(found)} 条，要替换现有的给分点吗？", parent=self.editor):
+                return
+        self.rubric_text.delete('1.0', tk.END)
+        self.rubric_text.insert('1.0', "\n".join(found))
+        self._editor_changed()
+
+    def refresh_answer_summary(self):
+        if not hasattr(self, 'answer_summary'):
+            return
+        T = self.THEME
+        ans = self.answer_text.get('1.0', tk.END).strip()
+        items = parse_rubric(self.rubric_text.get('1.0', tk.END))
+        try:
+            mx = float(self.max_score_entry.get().strip() or 0)
+        except ValueError:
+            mx = 0
+        total = sum(v for _, v in items if v is not None)
+        if ans:
+            first = ans.splitlines()[0]
+            first = first if len(first) <= 16 else first[:16] + "…"
+            line1 = f"参考答案 {len(ans)} 字：{first}"
+        else:
+            line1 = "参考答案：未填写"
+        if items:
+            ok = abs(total - mx) < 0.01
+            line2 = f"给分点 {len(items)} 条，共 {fmt_score(total)} 分" + (" ✓" if ok else f"（满分 {fmt_score(mx)}）")
+        else:
+            ok = True
+            line2 = "给分点：未填，由 AI 拆分"
+        self.answer_summary.config(text=line1 + "\n" + line2, fg=T['text'] if (ans and ok) else T['danger'])
+        if hasattr(self, 'editor_title'):
+            q = self.question_num_entry.get().strip() or "?"
+            self.editor_title.config(text=f"第 {q} 题 · 满分 {fmt_score(mx) if mx else '?'} 分")
+        if hasattr(self, 'rubric_status'):
+            if items:
+                self.rubric_status.config(text=f"合计 {fmt_score(total)} / {fmt_score(mx)} 分  " + ("✓ 与满分一致" if ok else "✗ 与满分不一致"),
+                                          fg=T['ok'] if ok else T['danger'])
+            else:
+                self.rubric_status.config(text="", fg=T['sub'])
+
+
     def create_widgets(self):
         """创建界面（紧凑卡片式，统一行高）"""
         T, F = self.THEME, self.FONT
@@ -571,9 +742,9 @@ class SimpleGradingUI:
         tools = tk.Frame(bar, bg=T['head'], height=self.ROW_H)
         tools.pack(side=tk.RIGHT, padx=10)
         self.update_btn = self._small(tools, "更新", lambda: self.check_update_ui(silent=False),
-                                      T['head2'], 'white', '#4A4ED8', width=42)
-        self._small(tools, "笔记", self.setup_obsidian_path, T['head2'], 'white', '#4A4ED8', padx=4, width=42)
-        self._small(tools, "模型", self.setup_model, T['head2'], 'white', '#4A4ED8', width=42)
+                                      T['head2'], 'white', T['head_a'], width=42)
+        self._small(tools, "笔记", self.setup_obsidian_path, T['head2'], 'white', T['head_a'], padx=4, width=42)
+        self._small(tools, "模型", self.setup_model, T['head2'], 'white', T['head_a'], width=42)
 
         # ===== 底部状态栏 =====
         status = tk.Frame(self.root, bg=T['head'], height=22)
@@ -594,8 +765,8 @@ class SimpleGradingUI:
         self.region_preview = tk.Label(slot, text="未框选", bg='#E6F9FD', fg=T['sub'], font=(F, 8), anchor='w', padx=8)
         self.region_preview.pack(fill=tk.BOTH, expand=True)
 
-        # ===== ② 题目 =====
-        _, body = self._card(main_frame, "② 题目", hint="自动保存", expand=True, color=T['purple'])
+        # ===== ② 题目（参考答案、给分点在大窗口里编辑）=====
+        _, body = self._card(main_frame, "② 题目", hint="自动保存", color=T['teal'])
         r = self._row(body)
         self._label(r, "题号").pack(side=tk.LEFT)
         s = self._slot(r, width=64, padx=(6, 14))
@@ -607,31 +778,26 @@ class SimpleGradingUI:
         self.max_score_entry.pack(fill=tk.BOTH, expand=True)
         self.half_var = tk.BooleanVar(value=False)
         tk.Checkbutton(r, text="可给0.5", variable=self.half_var, command=self.save_config, font=(F, 8),
-                       bg=T['card'], fg=T['text'], activebackground=T['card'], selectcolor='#F1EEFF',
+                       bg=T['card'], fg=T['text'], activebackground=T['card'], selectcolor=T['teal_bg'],
                        bd=0, highlightthickness=0).pack(side=tk.RIGHT)
 
-        r = self._row(body)
-        self._label(r, "参考答案").pack(side=tk.LEFT)
-        self._small(r, "清空", lambda: (self.answer_text.delete('1.0', tk.END), self.save_question_data()),
-                    '#F1EEFF', T['purple'], '#E4DDFF', width=48)
-        self._small(r, "截图识别", self.capture_standard_answer, T['purple'], 'white', '#7342E8', padx=(0, 6))
+        # 摘要 + 打开编辑窗口
+        sm = tk.Frame(body, bg=T['teal_bg'], highlightthickness=1, highlightbackground='#C3FAE8')
+        sm.pack(fill=tk.X)
+        btn_slot = self._slot(sm, width=self.SMALL_W + 8, height=44, side=tk.RIGHT, padx=6)
+        self._btn(btn_slot, "编辑\n答案", self.open_answer_editor, T['teal'], active=T['teal_d'],
+                  bold=True).pack(fill=tk.BOTH, expand=True, pady=6)
+        self.answer_summary = tk.Label(sm, text="", font=(F, 8), bg=T['teal_bg'], fg=T['text'],
+                                       anchor='w', justify=tk.LEFT, padx=8, pady=6)
+        self.answer_summary.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.answer_summary.bind('<Button-1>', lambda e: self.open_answer_editor())
 
-        self.answer_text = scrolledtext.ScrolledText(body, height=3, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
-                                                     bg=T['input'], fg=T['text'], highlightthickness=1,
-                                                     highlightbackground=T['line'], highlightcolor=T['primary'])
-        self.answer_text.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        # 参考答案 / 给分点 的大编辑窗口（启动时建好、先隐藏）
+        self.build_answer_editor()
 
-        r = self._row(body)
-        self._label(r, "给分点").pack(side=tk.LEFT)
-        self._label(r, "每行：要点｜分值（可不填）", fg='#A3A7C2').pack(side=tk.LEFT, padx=(6, 0))
-        self.rubric_text = scrolledtext.ScrolledText(body, height=3, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
-                                                     bg=T['input'], fg=T['text'], highlightthickness=1,
-                                                     highlightbackground=T['line'], highlightcolor=T['primary'])
-        self.rubric_text.pack(fill=tk.BOTH, expand=True)
-
-        for w in (self.question_num_entry, self.max_score_entry, self.answer_text, self.rubric_text):
+        for w in (self.question_num_entry, self.max_score_entry):
             w.bind('<FocusOut>', lambda e: self.save_question_data())
-            w.bind('<KeyRelease>', lambda e: self.save_question_data())
+            w.bind('<KeyRelease>', lambda e: (self.save_question_data(), self.refresh_answer_summary()))
 
         # ===== ③ 批改控制 =====
         _, body = self._card(main_frame, "③ 批改", hint="空格 开始 · Esc 停止", color=T['orange'])
@@ -640,7 +806,7 @@ class SimpleGradingUI:
         big.pack(fill=tk.X, pady=(0, 8))
         s = self._slot(big, width=84, height=self.BIG_H, side=tk.RIGHT)
         self.pause_btn = self._btn(s, "⏸ 暂停", self.toggle_pause, T['slate'], size=10, bold=True,
-                                   state=tk.DISABLED, disabledforeground='#E4DDFF')
+                                   state=tk.DISABLED, disabledforeground='#C3FAE8')
         self.pause_btn.pack(fill=tk.BOTH, expand=True)
         s = self._slot(big, height=self.BIG_H, side=tk.LEFT, padx=(0, 6), expand=True)
         self.grade_btn = self._btn(s, self.GRADE_TEXT, self.grade_answer, T['primary'], size=10, bold=True,
@@ -685,7 +851,7 @@ class SimpleGradingUI:
                                                fg=T['sub'], wraplength=240, justify=tk.LEFT)
         self.current_analysis_label.pack(pady=(2, 6), padx=8)
 
-        self.result_text = scrolledtext.ScrolledText(body, height=7, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
+        self.result_text = scrolledtext.ScrolledText(body, height=10, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
                                                      bg=T['input'], fg=T['sub'], highlightthickness=1,
                                                      highlightbackground=T['line'])
         self.result_text.pack(fill=tk.BOTH, expand=True)
@@ -716,6 +882,7 @@ class SimpleGradingUI:
             self.rubric_text.delete('1.0', tk.END)
             self.rubric_text.insert('1.0', self.saved_rubric)
         self.half_var.set(self.half_point)
+        self.refresh_answer_summary()
             
         # 2. 复选框状态
         if hasattr(self, 'auto_var'):
@@ -759,35 +926,43 @@ class SimpleGradingUI:
         selector.start()
     
     def capture_standard_answer(self):
-        """截图参考答案并识别文字"""
+        """截图参考答案并识别文字（追加到参考答案末尾）"""
+        editor_open = self.editor.winfo_viewable()
+        self.editor.withdraw()
         self.root.iconify()
         time.sleep(0.3)
-        
+
         def on_captured(region):
             x, y, w, h = region
             img = pyautogui.screenshot(region=(x, y, w, h))
             self.root.deiconify()
-            
-            # 识别文字
-            try:
-                self.log("正在识别参考答案...")
-                prompt = "请识别图片中的文字内容，直接返回文字，不要添加任何说明。"
-                
-                # 使用统一接口调用 (支持所有模型)
-                answer_text = self.call_ai_api(prompt, img, need_json=False)
-                answer_text = answer_text.strip()
-                
-                # 填入文本框
-                self.answer_text.delete('1.0', tk.END)
-                self.answer_text.insert('1.0', answer_text)
-                self.log("✓ 参考答案已识别并填入")
-            except Exception as e:
-                self.log(f"⚠ 识别失败: {str(e)}")
-                messagebox.showerror("错误", f"识别失败：{str(e)}")
-        
+            self.open_answer_editor() if editor_open else None
+            self.log("正在识别参考答案...")
+
+            def worker():
+                try:
+                    prompt = ("请把图片中的参考答案和评分标准原样转写成文字。数学式用常见写法或 LaTeX，"
+                              "保留每一步后面标注的分值（如“（2分）”），不要添加任何说明。")
+                    text = self.call_ai_api(prompt, img, need_json=False).strip()
+
+                    def fill():
+                        cur = self.answer_text.get('1.0', tk.END).strip()
+                        if cur:
+                            self.answer_text.insert(tk.END, "\n" + text)
+                        else:
+                            self.answer_text.insert('1.0', text)
+                        self._editor_changed()
+                        self.log("✓ 参考答案已识别" + ("并追加" if cur else "并填入"))
+                    self.ui(fill)
+                except Exception as e:
+                    err = str(e)
+                    self.log(f"⚠ 识别失败: {err}")
+                    self.ui(lambda: messagebox.showerror("错误", f"识别失败：{err}"))
+            threading.Thread(target=worker, daemon=True).start()
+
         selector = ScreenshotSelector(on_captured)
         selector.start()
-    
+
     def update_region_preview(self):
         """更新区域预览"""
         if self.answer_region:
@@ -1343,7 +1518,7 @@ class SimpleGradingUI:
             except Exception as e:
                 messagebox.showerror("错误", f"模型初始化失败: {str(e)}\n请检查Key或网络设置")
         
-        tk.Button(frame, text="保存配置", command=save, bg=self.THEME['head'], fg='white', activebackground='#4A4ED8', activeforeground='white', relief=tk.FLAT, bd=0, cursor='hand2', width=15, pady=3).pack(pady=5)
+        tk.Button(frame, text="保存配置", command=save, bg=self.THEME['head'], fg='white', activebackground=self.THEME['head_a'], activeforeground='white', relief=tk.FLAT, bd=0, cursor='hand2', width=15, pady=3).pack(pady=5)
     
     def setup_score_buttons(self):
         """设置自动提交位置"""

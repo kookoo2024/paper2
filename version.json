@@ -1,11 +1,11 @@
 {
-  "version": "1.3.0",
-  "notes": "批改更准：给分点逐条得分、程序加总；先转写再判分；把握度低/看不清/其他解法强制人工确认；空白卷直接0分；可给0.5分；截图留边；移除代码里残留的硅基流动Key",
+  "version": "1.4.0",
+  "notes": "去掉紫色，改亮蓝+翠绿；参考答案和给分点改到大窗口编辑（左右分栏、大字号、合计实时校验、从答案提取给分点）；截图识别改后台运行并追加；输入框里打空格不再误触发批改",
   "files": {
-    "zhixue_simple.py": "3eff6256392fbc83eea7987c59fae9d0abd0ecc454e89e10b2594da51be3457b",
+    "zhixue_simple.py": "8beabb18f85856b41af15af31431b3a812ca39c506fb96db664f70e4c33e0089",
     "start.pyw": "df2bda5027b52182584f74fc587977a484742792d53d8f21bd5a174012995249",
     "make_shortcut.bat": "925555f845c456b3211ad06c624bf67a64f2f4fc58c5a35817995f169477f3c9",
-    "README.md": "8acbd457695ccdc9e0ce7ddd194f3f028e434bbeca85644ec55629ace2e4d9d1",
+    "README.md": "329d6ac06cc2fe773f6617efa6cc6eaa0bfe2543f42e137707c9daf97127cf83",
     "requirements.txt": "9ed45a0f33585527bbb563d53c17a68d55ec63af2117c61d62204676c525328e"
   }
 }
