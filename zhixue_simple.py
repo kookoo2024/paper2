@@ -59,7 +59,7 @@ PROVIDERS = {
 HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
 
 # ================= 在线更新 =================
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -274,6 +274,137 @@ class ScreenshotSelector:
         self.top.destroy()
 
 
+# ---------------- 评分辅助 ----------------
+def fmt_score(x):
+    """10.0 -> 10，7.5 -> 7.5"""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return x
+    return int(x) if abs(x - round(x)) < 1e-9 else round(x, 2)
+
+
+def parse_rubric(text):
+    """解析给分点：每行「要点｜分值」，也接受 | : ： 和末尾的「2分」"""
+    import re
+    items = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(.*?)[\s|｜:：,，]*([0-9]+(?:\.[0-9]+)?)\s*分?\s*$", line)
+        if m and m.group(1).strip():
+            items.append((m.group(1).strip(" |｜:："), float(m.group(2))))
+        else:
+            items.append((line, None))
+    return items
+
+
+def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, half_point):
+    rubric = parse_rubric(rubric_text)
+    if rubric:
+        rows = "\n".join(f"{i+1}. {p}（{fmt_score(v) if v is not None else '?'}分）" for i, (p, v) in enumerate(rubric))
+        rubric_part = f"【给分点】（老师给定，必须逐条按此判，不得增删）：\n{rows}"
+    else:
+        rubric_part = (f"【给分点】老师未单独列出。请先根据参考答案中的评分标准拆出给分点，"
+                       f"各点分值之和必须等于满分 {fmt_score(max_score)} 分；参考答案里写了分值的，严格照用。")
+    step = "0.5" if half_point else "1"
+    return f"""你是经验丰富、公正严谨的高中阅卷老师。图片是一名学生对第 {question_num} 题的作答。
+
+满分：{fmt_score(max_score)} 分
+【参考答案】：
+{standard_answer}
+
+{rubric_part}
+
+请严格按下面两步做：
+第一步：把学生写的内容原样转写出来（公式用文字或 LaTeX），只写看到的，不要补全、不要纠正。某处字迹实在看不清，就在那里写【看不清】，绝不猜。
+第二步：对照转写内容，逐个给分点判定得分。
+- 学生用了与参考答案不同但正确的方法，按对应步骤等价给分，并把 alt_method 设为 true。
+- 结果正确但关键步骤缺失，只给结果分；过程正确但最后算错，给过程分。
+- 前面一步算错导致后面数值不对、但后面方法正确的，后面的步骤酌情给分。
+- 每个给分点的得分在 0 到该点分值之间，最小单位 {step} 分。
+- 不要因为书写格式、字迹潦草（能看清的）扣分。
+
+只返回 JSON，字段顺序如下：
+{{
+  "transcription": "学生作答的原样转写",
+  "items": [
+    {{"point": "给分点内容", "full": 该点分值, "got": 学生该点得分, "reason": "得分或扣分理由，一句话"}}
+  ],
+  "score": 各点得分之和,
+  "confidence": "高 或 中 或 低（对识别和判分的把握）",
+  "unclear": 是否有影响判分的看不清之处(true/false),
+  "alt_method": 是否用了参考答案以外的解法(true/false),
+  "analysis": "一两句评语"
+}}"""
+
+
+def settle_score(result, max_score, half_point):
+    """按给分点加总得到最终分，并返回需要人工复核的原因列表"""
+    import math
+    reasons = []
+    items = []
+    for it in result.get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        try:
+            full = float(it.get("full", 0) or 0)
+            got = float(it.get("got", 0) or 0)
+        except (TypeError, ValueError):
+            reasons.append("给分点数据异常")
+            continue
+        got = max(0.0, min(got, full)) if full > 0 else max(0.0, got)
+        items.append({"point": str(it.get("point", "")), "full": full, "got": got, "reason": str(it.get("reason", "") or "")})
+
+    if result.get("blank"):
+        return 0, items, reasons
+
+    if items:
+        total = sum(i["got"] for i in items)
+        full_sum = sum(i["full"] for i in items)
+        if abs(full_sum - max_score) > 0.01:
+            reasons.append(f"给分点合计 {fmt_score(full_sum)} 分≠满分")
+        try:
+            claimed = float(result.get("score"))
+            if abs(claimed - total) > 0.01:
+                reasons.append(f"模型总分 {fmt_score(claimed)} 与逐点相加 {fmt_score(total)} 不一致")
+        except (TypeError, ValueError):
+            pass
+    else:
+        reasons.append("模型没有给出逐点得分")
+        try:
+            total = float(result.get("score", 0))
+        except (TypeError, ValueError):
+            total = 0.0
+
+    total = max(0.0, min(total, float(max_score)))
+    unit = 0.5 if half_point else 1.0
+    total = math.floor(total / unit + 0.5 + 1e-9) * unit   # 四舍五入到最小单位
+
+    conf = str(result.get("confidence", "")).strip()
+    if conf.startswith("低") or conf.lower().startswith("low"):
+        reasons.append("模型把握度低")
+    if result.get("unclear") is True or "【看不清】" in str(result.get("transcription", "")):
+        reasons.append("有看不清的地方")
+    if result.get("alt_method") is True:
+        reasons.append("学生用了其他解法")
+    return fmt_score(total), items, reasons
+
+
+def ink_ratio(img):
+    """答题区域里“墨迹”像素的占比，用来判断空白卷"""
+    try:
+        g = img.convert("L")
+        g.thumbnail((400, 400))
+        hist = g.histogram()
+        dark = sum(hist[:140])
+        return dark / max(1, sum(hist))
+    except Exception:
+        return 1.0  # 算不出来就当有内容，交给模型
+
+
+
 class SimpleGradingUI:
     def __init__(self, root):
         self.root = root
@@ -283,8 +414,8 @@ class SimpleGradingUI:
         self._main_thread = threading.current_thread()
         self.root.title(f"阅卷 V{APP_VERSION}")
         
-        self.root.geometry("300x800")
-        self.root.resizable(False, False)  # 固定大小
+        self.root.geometry("300x880")
+        self.root.resizable(False, True)  # 宽度固定，高度可拖（小屏幕可以拉矮）
         self.root.attributes('-topmost', True)  # 窗口置顶
 
         
@@ -309,6 +440,9 @@ class SimpleGradingUI:
         self.saved_question_num = ""
         self.saved_max_score = "10"
         self.saved_answer = ""
+        self.saved_rubric = ""        # 给分点（每行：要点｜分值）
+        self.half_point = False       # 是否允许 0.5 分
+        self.blank_threshold = 0.0015 # 墨迹占比低于此值视为空白卷
         
         self.save_timer = None # 自动保存定时器
 
@@ -471,6 +605,10 @@ class SimpleGradingUI:
         s = self._slot(r, width=48, padx=(6, 0))
         self.max_score_entry = self._entry(s, 4)
         self.max_score_entry.pack(fill=tk.BOTH, expand=True)
+        self.half_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(r, text="可给0.5", variable=self.half_var, command=self.save_config, font=(F, 8),
+                       bg=T['card'], fg=T['text'], activebackground=T['card'], selectcolor='#F1EEFF',
+                       bd=0, highlightthickness=0).pack(side=tk.RIGHT)
 
         r = self._row(body)
         self._label(r, "参考答案").pack(side=tk.LEFT)
@@ -478,12 +616,20 @@ class SimpleGradingUI:
                     '#F1EEFF', T['purple'], '#E4DDFF', width=48)
         self._small(r, "截图识别", self.capture_standard_answer, T['purple'], 'white', '#7342E8', padx=(0, 6))
 
-        self.answer_text = scrolledtext.ScrolledText(body, height=4, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
+        self.answer_text = scrolledtext.ScrolledText(body, height=3, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
                                                      bg=T['input'], fg=T['text'], highlightthickness=1,
                                                      highlightbackground=T['line'], highlightcolor=T['primary'])
-        self.answer_text.pack(fill=tk.BOTH, expand=True)
+        self.answer_text.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
-        for w in (self.question_num_entry, self.max_score_entry, self.answer_text):
+        r = self._row(body)
+        self._label(r, "给分点").pack(side=tk.LEFT)
+        self._label(r, "每行：要点｜分值（可不填）", fg='#A3A7C2').pack(side=tk.LEFT, padx=(6, 0))
+        self.rubric_text = scrolledtext.ScrolledText(body, height=3, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
+                                                     bg=T['input'], fg=T['text'], highlightthickness=1,
+                                                     highlightbackground=T['line'], highlightcolor=T['primary'])
+        self.rubric_text.pack(fill=tk.BOTH, expand=True)
+
+        for w in (self.question_num_entry, self.max_score_entry, self.answer_text, self.rubric_text):
             w.bind('<FocusOut>', lambda e: self.save_question_data())
             w.bind('<KeyRelease>', lambda e: self.save_question_data())
 
@@ -539,7 +685,7 @@ class SimpleGradingUI:
                                                fg=T['sub'], wraplength=240, justify=tk.LEFT)
         self.current_analysis_label.pack(pady=(2, 6), padx=8)
 
-        self.result_text = scrolledtext.ScrolledText(body, height=8, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
+        self.result_text = scrolledtext.ScrolledText(body, height=7, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
                                                      bg=T['input'], fg=T['sub'], highlightthickness=1,
                                                      highlightbackground=T['line'])
         self.result_text.pack(fill=tk.BOTH, expand=True)
@@ -566,6 +712,10 @@ class SimpleGradingUI:
         if self.saved_answer:
             self.answer_text.delete('1.0', tk.END)
             self.answer_text.insert('1.0', self.saved_answer)
+        if self.saved_rubric:
+            self.rubric_text.delete('1.0', tk.END)
+            self.rubric_text.insert('1.0', self.saved_rubric)
+        self.half_var.set(self.half_point)
             
         # 2. 复选框状态
         if hasattr(self, 'auto_var'):
@@ -687,14 +837,21 @@ class SimpleGradingUI:
             start_time = time.time()
             
             question_num = self.question_num_entry.get().strip()
-            max_score = int(self.max_score_entry.get().strip() or "10")
+            max_score = float(self.max_score_entry.get().strip() or "10")
+            if max_score == int(max_score):
+                max_score = int(max_score)
             standard_answer = self.answer_text.get('1.0', tk.END).strip()
             
             self.root.after(0, lambda: self.log(f"\n[{datetime.now().strftime('%H:%M:%S')}] 批改题号{question_num}..."))
             
             # 截取学生答案
             x, y, w, h = self.answer_region
-            student_img = pyautogui.screenshot(region=(x, y, w, h))
+            # 四周多留 6 像素，避免切掉最后一行或边上的字
+            sw, sh = pyautogui.size()
+            pad = 6
+            x0, y0 = max(0, x - pad), max(0, y - pad)
+            x1, y1 = min(sw, x + w + pad), min(sh, y + h + pad)
+            student_img = pyautogui.screenshot(region=(x0, y0, x1 - x0, y1 - y0))
             # 防重复：页面没翻到下一份时截图会和上一张一样，自动模式下直接停，避免同一份卷子重复提交
             import hashlib
             img_hash = hashlib.md5(student_img.tobytes()).hexdigest()
@@ -704,36 +861,22 @@ class SimpleGradingUI:
             self.last_img_hash = img_hash
             self.current_student_img = student_img # 保存引用以供导出
             
-            # 构建提示
-            prompt = f"""你是严谨的判卷老师，请严格按照【参考答案】中的评分标准（步骤分）批改这道题。
+            # 空白卷：墨迹太少直接判 0，不调用模型（省时间，也防止模型对着空白“脑补”）
+            ix, iy = x - x0 + 4, y - y0 + 4   # 只看原框选区域内部，避开边框线
+            ink = ink_ratio(student_img.crop((ix, iy, max(ix + 1, ix + w - 8), max(iy + 1, iy + h - 8))))
+            if ink < self.blank_threshold:
+                self.log(f"  空白卷（墨迹占比 {ink:.2%}），直接判 0 分")
+                result = {"transcription": "（空白）", "items": [], "score": 0, "confidence": "高",
+                          "unclear": False, "alt_method": False, "analysis": "空白卷，未作答", "blank": True}
+                elapsed = time.time() - start_time
+                self.grading_count += 1
+                self.total_time += elapsed
+                self.root.after(0, lambda: self.display_result(result, max_score, elapsed, "空白检测"))
+                return
 
-题号：{question_num}
-满分：{max_score}分
-参考答案：
-{standard_answer}
+            rubric = self.rubric_text.get('1.0', tk.END).strip()
+            prompt = build_grading_prompt(question_num, max_score, standard_answer, rubric, self.half_var.get())
 
-图片是学生的答案。
-
-请仔细对比学生答案与参考答案，严格判定每一步是否正确。如果是步骤给分题，必须检查学生是否写出了关键步骤。
-如果学生答案与参考答案不仅仅是格式不同，而是逻辑或数值错误，必须扣分。
-
-按以下JSON格式返回：
-{{
-    "student_answer": "学生写的答案内容（简述）",
-    "score": 得分数字,
-    "deduction_details": [
-        {{"point": "具体扣分原因（如：未化简、计算错误、步骤缺失）", "deduction": 扣分值}}
-    ],
-    "analysis": "详细评语（指出哪里错了，为什么扣分）"
-}}
-
-严厉评分规则：
-1. 总分不能超过满分，不能低于0分。
-2. 必须严格执行参考答案中的给分点，步骤缺失扣步骤分。
-3. 严格计算最终得分 = 满分 - 扣分总和。
-
-只返回JSON，不要其他内容。"""
-            
             try:
                 # 使用统一接口，强制 JSON
                 result = self.call_ai_api(prompt, student_img, need_json=True)
@@ -762,58 +905,58 @@ class SimpleGradingUI:
                 self.root.after(0, lambda: self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT))
     
     def display_result(self, result, max_score, elapsed, model_name="Unknown"):
-        """显示结果"""
-        try:
-            score = float(result.get('score', 0))
-        except (TypeError, ValueError):
-            score = 0
-        score = max(0, min(score, max_score))  # 防止模型给出超过满分或负分
-        if score == int(score):
-            score = int(score)
+        """显示结果：总分由程序按给分点加总，不信任模型自己算的总分"""
+        score, items, reasons = settle_score(result, max_score, self.half_var.get())
+        need_review = bool(reasons)
         analysis = result.get('analysis', '')
-        deductions = result.get('deduction_details', [])
-        
-        # 更新显示 (包含模型名称)
-        self.current_score_label.config(text=f"建议分数  {score} / {max_score}")
-        
-        detail_text = f"评语: {analysis}\n"
-        if deductions:
-            detail_text += "\n扣分详情:\n"
-            for d in deductions:
-                detail_text += f"  • {d.get('point', '未命名扣分点')}: -{d.get('deduction', 0)}分\n"
-        
-        self.current_analysis_label.config(text=detail_text)
-        
-        self.log(f"  得分: {score}/{max_score} 用时: {elapsed:.1f}s ({model_name})")
-        self.log(f"\n💡 建议分数: {score} 分")
-        
+        transcription = (result.get('transcription') or '').strip()
+        conf = result.get('confidence', '')
+
+        # 兼容旧的导出格式（Obsidian / HTML 读 score 和 deduction_details）
+        result['score'] = score
+        result['deduction_details'] = [
+            {"point": f"{it['point']}" + (f"：{it['reason']}" if it.get('reason') else ''),
+             "deduction": fmt_score(it['full'] - it['got'])}
+            for it in items if it['got'] < it['full']]
+        if transcription:
+            result['student_answer'] = transcription
+
+        self.current_score_label.config(text=f"建议分数  {fmt_score(score)} / {max_score}")
+
+        detail_text = ""
+        if reasons:
+            detail_text += "⚠ " + "；".join(reasons) + "，请人工核对\n\n"
+        if transcription:
+            t = transcription if len(transcription) <= 160 else transcription[:160] + "…"
+            detail_text += f"识别：{t}\n\n"
+        if items:
+            for it in items:
+                mark = "✓" if it['got'] >= it['full'] else ("✗" if it['got'] == 0 else "△")
+                line = f"{mark} {it['point']}  {fmt_score(it['got'])}/{fmt_score(it['full'])}"
+                if it.get('reason') and it['got'] < it['full']:
+                    line += f"（{it['reason']}）"
+                detail_text += line + "\n"
+        if analysis:
+            detail_text += f"\n评语：{analysis}"
+        if conf:
+            detail_text += f"\n把握度：{conf}"
+
+        self.current_analysis_label.config(text=detail_text.strip())
+
+        self.log(f"  得分: {fmt_score(score)}/{max_score}  把握度: {conf or '-'}  用时: {elapsed:.1f}s ({model_name})")
+        if transcription:
+            self.log(f"  识别: {transcription[:80]}")
+        for r_ in reasons:
+            self.log(f"  ⚠ {r_}，本份强制人工确认")
+
         self.update_stats()
-        
-        # 计算当前统计数据供保存使用
         avg_time = self.total_time / self.grading_count if self.grading_count > 0 else 0
-        
-        # 自动保存到 Obsidian
         if hasattr(self, 'obsidian_path') and self.obsidian_path:
             self.save_to_obsidian(result, max_score, self.current_student_img, model_name, elapsed, avg_time)
-        
-        # 自动保存为 HTML
         self.save_to_html(result, max_score, self.current_student_img, model_name, elapsed, avg_time)
-        
-        # 自检：扣分合计应等于 满分-得分；对不上说明模型自相矛盾，强制人工确认
-        try:
-            ded_sum = sum(float(d.get('deduction', 0) or 0) for d in deductions)
-        except (TypeError, ValueError, AttributeError):
-            ded_sum = None
-        need_review = ded_sum is None or abs((max_score - ded_sum) - score) > 0.01
-        if need_review:
-            detail_text = f"⚠ 扣分合计({ded_sum})与得分对不上，请人工核对！\n\n" + detail_text
-            self.log("⚠ 扣分合计与得分不一致，本份强制人工确认")
 
-        # 设置等待确认状态
         self.waiting_for_confirm = True
         self.pending_score = score
-        
-        # 弹出确认对话框
         self.show_confirm_dialog(score, max_score, detail_text, force=need_review)
 
     def init_model(self):
@@ -1320,7 +1463,7 @@ class SimpleGradingUI:
         # 创建自定义对话框
         dialog = tk.Toplevel(self.root)
         dialog.title("确认分数")
-        dialog.geometry("400x350")
+        dialog.geometry("440x480")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -1349,7 +1492,7 @@ class SimpleGradingUI:
         
         detail_scroll = scrolledtext.ScrolledText(
             detail_frame,
-            height=8,
+            height=12,
             font=('微软雅黑', 9),
             wrap=tk.WORD
         )
@@ -1662,6 +1805,10 @@ class SimpleGradingUI:
                 self.saved_answer = self.answer_text.get('1.0', tk.END).strip()
             if hasattr(self, 'delay_entry'):
                 self.saved_delay = self.delay_entry.get().strip()
+            if hasattr(self, 'rubric_text'):
+                self.saved_rubric = self.rubric_text.get('1.0', tk.END).strip()
+            if hasattr(self, 'half_var'):
+                self.half_point = bool(self.half_var.get())
 
             config = {
                 'answer_region': self.answer_region,
@@ -1670,6 +1817,9 @@ class SimpleGradingUI:
                 'question_num': self.saved_question_num,
                 'max_score': self.saved_max_score,
                 'answer': self.saved_answer,
+                'rubric': self.saved_rubric,
+                'half_point': self.half_point,
+                'blank_threshold': self.blank_threshold,
                 'auto_continue': self.auto_var.get() if hasattr(self, 'auto_var') else False,
                 'auto_click': self.auto_click_var.get() if hasattr(self, 'auto_click_var') else False,
                 'skip_confirm': self.skip_confirm_var.get() if hasattr(self, 'skip_confirm_var') else False,
@@ -1703,6 +1853,9 @@ class SimpleGradingUI:
                 self.saved_question_num = config.get('question_num', '')
                 self.saved_max_score = config.get('max_score', '10')
                 self.saved_answer = config.get('answer', '')
+                self.saved_rubric = config.get('rubric', '')
+                self.half_point = bool(config.get('half_point', False))
+                self.blank_threshold = float(config.get('blank_threshold', 0.0015))
                 
                 # 加载复选框状态
                 self.saved_auto_continue = config.get('auto_continue', False)
@@ -1725,7 +1878,7 @@ class SimpleGradingUI:
                 if "SiliconFlow" not in self.provider_settings:
                     self.provider_settings["SiliconFlow"] = {
                         "base_url": "https://api.siliconflow.cn/v1",
-                        "api_key": "sk-lyngjsmigyodfmdwvmzyzishmwhfeaownhghkyjsryosvluk",
+                        "api_key": "",
                         "model_name": "Qwen/Qwen2-VL-72B-Instruct"
                     }
                 
