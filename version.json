@@ -1,11 +1,9 @@
 {
-  "version": "1.6.0",
-  "notes": "批改逻辑恢复为原版：原版提示词、原版请求方式（Gemini 官方库直接调用；其他家 PNG 原图 + max_tokens 4096，不加任何额外参数）、原版结果显示（得分、扣分详情、评语）。去掉逐点加总、空白卷检测、强制确认。保留：新界面、在线更新、预设各家地址、后台批改不卡界面；填了给分点会附在参考答案后面一起发给模型",
+  "version": "1.7.3",
+  "notes": "v1.7.3：给分点不再截断，按你给的评分标准严格逐条对照；等价解法（切点弦/极点极线）不再误判 0 分；自动裁掉截图底部任务栏；三次判分取中位数，减少偏松；单份约 9~10 秒。",
   "files": {
-    "zhixue_simple.py": "dd2c772c02b859927eca432827199fc2bfbe25ce1b0a24adbe9b63c35dc17ce1",
-    "start.pyw": "df2bda5027b52182584f74fc587977a484742792d53d8f21bd5a174012995249",
-    "make_shortcut.bat": "925555f845c456b3211ad06c624bf67a64f2f4fc58c5a35817995f169477f3c9",
-    "README.md": "329d6ac06cc2fe773f6617efa6cc6eaa0bfe2543f42e137707c9daf97127cf83",
-    "requirements.txt": "9ed45a0f33585527bbb563d53c17a68d55ec63af2117c61d62204676c525328e"
+    "zhixue_simple.py": "46d9eb28884bfad2cb1697a56ff1f04d82cbab5ccf5297cf9cb57b9f008e82c5",
+    "README.md": "9b009c722b9604a65aa751db3e6cad075618524fe47afe3ba3d62b088b01e7da",
+    "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3"
   }
 }

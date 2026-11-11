@@ -5,9 +5,8 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-import google.generativeai as genai
 import pyautogui
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+from PIL import Image, ImageTk
 import json
 import time
 from datetime import datetime
@@ -18,6 +17,9 @@ import base64
 import urllib.request
 import urllib.error
 import io
+
+HTTP_TIMEOUT = 120  # 兜底超时（秒）；批改调用会传更短的 15 秒目标
+GRADE_TIMEOUT = 15  # 单题批改硬上限：超过就中止，保证整体 <20 秒
 
 # 配置 Gemini API
 
@@ -103,10 +105,55 @@ PROVIDERS = {
 }
 
 GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-HTTP_TIMEOUT = 120  # 秒：连续这么久收不到任何数据才算超时（流式接收，长回答不会被误判）
+
+# ================= Gemini Key 池轮换（2026-11-11） =================
+import os as _os  # 模块顶部可能尚未 import os，这里自备
+KEYS_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "keys.json")
+
+def _keys_load():
+    try:
+        with open(KEYS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def keys_status():
+    """返回 (可用key列表, 池dict)——过滤掉冷却中的 key"""
+    kp = _keys_load()
+    if not kp:
+        return [], None
+    now = time.time()
+    alive = [k for k in kp.get("pool", [])
+             if kp.get("cooldown", {}).get(k, 0) <= now]
+    return alive, kp
+
+def keys_cooldown(kp, k, seconds=65):
+    """把 key k 冷却 seconds 秒并落盘"""
+    kp.setdefault("cooldown", {})[k] = time.time() + seconds
+    try:
+        json.dump(kp, open(KEYS_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+def gemini_request_raw(api_key, model_name, body_bytes, timeout):
+    """单次 Gemini REST 调用，返回 (text, usage_dict)。供轮换循环调用。"""
+    import urllib.request, urllib.error
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model_name or 'gemini-2.5-flash'}:generateContent")
+    req = urllib.request.Request(url, data=body_bytes, headers={
+        "Content-Type": "application/json", "x-goog-api-key": api_key})
+    with http_open(req, timeout=timeout) as resp:
+        rj = json.loads(resp.read().decode("utf-8"))
+    text = rj["candidates"][0]["content"]["parts"][0]["text"]
+    return text, rj.get("usageMetadata", {})
+
+GEMINI_429_HINT = ("Gemini 额度用尽：免费档常见 20 次/天/项目，同一项目下多个 key 共用额度。"
+                   "程序会自动改用本机 Magpie；也可在「模型」里换 SiliconFlow/智谱等。")
+class QuotaError(Exception):
+    """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.3"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -194,12 +241,12 @@ def image_to_data_url(image, max_side=1600):
 STATS = {}   # 最近一次请求的耗时统计，用于日志诊断
 
 
-def post_chat_plain(url, data, headers):
+def post_chat_plain(url, data, headers, timeout=HTTP_TIMEOUT):
     import json
     body = dict(data)
     body.pop('stream', None)
     req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers)
-    with http_open(req) as resp:
+    with http_open(req, timeout=timeout) as resp:
         j = json.loads(resp.read().decode('utf-8'))
     msg = j['choices'][0]['message']
     text = msg.get('content') or ''
@@ -214,17 +261,17 @@ REASONING_ONLY_MSG = ("模型只输出了思考过程、没给出结果（这是
                       "建议在「模型」里换一个不带 thinking/R1/推理 字样的识图模型")
 
 
-def post_chat_stream(url, data, headers, log=None):
+def post_chat_stream(url, data, headers, log=None, timeout=HTTP_TIMEOUT):
     """以流式方式请求 chat/completions，边收边拼，并每 5 秒报一次进度；
     服务器不支持流式时按普通 JSON 解析；流式拿不到内容时再用普通方式请求一次。
-    超时只在“连续 HTTP_TIMEOUT 秒没收到任何数据”时触发。"""
+    总耗时超过 timeout 秒会主动中止，保证单题不被慢模型拖住。"""
     import json
     body = dict(data, stream=True)
     req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers)
     t0 = last_report = time.time()
     parts, think_chars, finish = [], 0, None
     STATS.update(first=None, think=0, chars=0, t0=t0)
-    with http_open(req) as resp:
+    with http_open(req, timeout=timeout) as resp:
         ctype = resp.headers.get('Content-Type', '')
         if 'event-stream' not in ctype:
             j = json.loads(resp.read().decode('utf-8'))
@@ -233,6 +280,8 @@ def post_chat_stream(url, data, headers, log=None):
                 raise Exception(REASONING_ONLY_MSG if msg.get('reasoning_content') else "模型没有返回内容")
             return msg['content']
         for raw in resp:
+            if time.time() - t0 > timeout:
+                raise TimeoutError(f"模型超过 {timeout} 秒未完成")
             line = raw.decode('utf-8', 'ignore').strip()
             if not line.startswith('data:'):
                 continue
@@ -271,17 +320,21 @@ def post_chat_stream(url, data, headers, log=None):
     STATS.update(think=think_chars, chars=len(text))
     if text.strip():
         return text
+    if time.time() - t0 > timeout:
+        raise TimeoutError(f"模型超过 {timeout} 秒未完成")
     if think_chars:
         raise Exception(REASONING_ONLY_MSG)
     if log:
         log("  流式没拿到内容，改用普通方式再请求一次…")
-    return post_chat_plain(url, data, headers)
+    return post_chat_plain(url, data, headers, timeout=timeout)
 
 
 def no_think_params(model_name, base_url):
     """尽量关掉模型的“思考”：阅卷是看图打分，不需要长推理，开着思考一份要几十秒甚至几分钟"""
     m = (model_name or '').lower()
     u = (base_url or '').lower()
+    if 'deepseek-v4.1-flash' in m:
+        return {"reasoning_effort": "none"}
     if 'siliconflow' in u:
         return {"enable_thinking": False}
     if 'bigmodel.cn' in u or 'volces.com' in u:
@@ -359,6 +412,26 @@ def fetch_models(base_url, api_key, vision_only=True, timeout=10):
         if vis:  # 有标注才过滤，否则全部返回
             return vis
     return ids
+
+
+def choose_magpie_model(models):
+    """从 Magpie 模型里挑一个识图快、不会“只想不答”的。
+    group/group 是路由组，容易走思考模型把 token 全花在 reasoning 上，放最后。"""
+    preferred = [
+        "workbuddy/deepseek-v4.1-flash",
+        "auto/deepseek-v4.1-flash",
+        "workbuddy/glm-5.3-flash",
+        "auto/glm-5.3-flash",
+        "zcode/GLM-5.3-Flash",
+        "opencode-zen-free/step-5-preview-free",
+    ]
+    for name in preferred:
+        if name in models:
+            return name
+    for name in models:
+        if name != "group/group":
+            return name
+    return models[0] if models else ""
 
 
 # 配置 PyAutoGUI
@@ -454,26 +527,189 @@ def fmt_score(x):
 
 
 def parse_rubric(text):
-    """解析给分点：每行「要点｜分值」，也接受 | : ： 和末尾的「2分」"""
+    """兼容旧调用：返回 (给分点, 分值) + 未带分值的说明。"""
+    rules = parse_rubric_rules(text)
+    return rules["scored"] + [(n, None) for n in rules["notes"]]
+
+
+def auto_rubric_from_answer(answer, max_score):
+    """从参考答案末尾的「……5分」「……15分」自动拆给分点。
+    若分值是累计分（常见写法），自动换算成每一步的增量，合计等于满分。"""
     import re
-    items = []
-    for line in (text or "").splitlines():
+    rows = []
+    for line in (answer or "").splitlines():
         line = line.strip()
+        m = re.match(r"^(.*?)[\s…·.．]*[（(【\[]?\s*(?:得|给)?\s*([0-9]+(?:\.[0-9]+)?)\s*分\s*[)）】\]]?[。；;]?\s*$", line)
+        if not m or not m.group(1).strip():
+            continue
+        point = m.group(1).strip().rstrip(" .…·")
+        if point[:2] in ("所以", "因此"):
+            point = point[2:].strip()
+        rows.append((point, float(m.group(2))))
+    if not rows:
+        return ""
+
+    vals = [v for _, v in rows]
+    # 累计分：5、7、15 -> 5、2、8
+    if len(vals) >= 2 and abs(vals[-1] - float(max_score)) <= 0.01 and all(
+            vals[i] <= vals[i + 1] + 1e-9 for i in range(len(vals) - 1)):
+        out, prev = [], 0.0
+        for point, v in rows:
+            inc = v - prev
+            prev = v
+            if inc > 0:
+                out.append(f"{point}｜{fmt_score(inc)}")
+        return "\n".join(out)
+
+    # 单步分：直接相加必须等于满分
+    if abs(sum(vals) - float(max_score)) <= 0.01:
+        return "\n".join(f"{point}｜{fmt_score(v)}" for point, v in rows)
+    return ""
+
+
+def auto_part_rubric(answer, max_score):
+    """按参考答案里的 (1)/(2) 分问，生成“大步骤”给分点。
+
+    多问题目用大步骤判分更稳：参考解里的中间式（如先写圆方程再相减）
+    不会被拆成独立小点，学生用等价解法时也不会因为没写某个中间式被误扣。
+    """
+    import re
+    lines = (answer or "").splitlines()
+    score_tail = (r"[\s…·.．]*[（(【\[]?\s*(?:得|给)?\s*"
+                  r"[0-9]+(?:\.[0-9]+)?\s*分\s*[)）】\]]?[。；;]?\s*$")
+    parts = []
+    for i, line in enumerate(lines):
+        m = re.search(r"(?:^|[：:。；;\s])[（(]\s*([0-9一二三四五六七八九十]+)\s*[）)]", line)
+        if not m:
+            continue
+        num = m.group(1)
+        if not (num.isdigit() or num in "一二三四五六七八九十"):
+            continue
+        desc = line[m.end():].strip(" ：:。；;")
+        desc = re.sub(r"^解\s*[:：]?\s*", "", desc)
+        desc = re.sub(score_tail, "", desc)
+        parts.append((f"第({num})问", desc, i))
+    # 同一个分问只取第一次出现
+    seen, uniq = set(), []
+    for p in parts:
+        if p[0] not in seen:
+            seen.add(p[0])
+            uniq.append(p)
+    parts = uniq
+    if len(parts) < 2:
+        return []
+
+    scores, descs = [], []
+    for idx, (label, desc, start) in enumerate(parts):
+        end = parts[idx + 1][2] if idx + 1 < len(parts) else len(lines)
+        last = None
+        for line in lines[start:end]:
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*分\s*$", line.strip())
+            if m:
+                last = float(m.group(1))
+        if last is None:
+            return []
+        scores.append(last)
+        body = [ln.strip() for ln in lines[start:end] if ln.strip()]
+        tail = re.sub(score_tail, "", body[-1]).strip(" ：:。；;") if body else ""
+        tail = re.sub(r"^(综上所述|综上|所以|故|即|则)[，,：: ]*", "", tail)
+        if tail and tail != desc:
+            merged = f"{desc}……{tail}"
+            if len(merged) <= 120:
+                desc = merged
+        descs.append(desc)
+
+    if abs(scores[-1] - float(max_score)) > 0.01:
+        return []
+    if any(scores[i] > scores[i + 1] + 1e-9 for i in range(len(scores) - 1)):
+        return []
+
+    out, prev = [], 0.0
+    for (label, _, _), score, desc in zip(parts, scores, descs):
+        inc = score - prev
+        prev = score
+        if inc > 0:
+            out.append((f"{label}：{desc}" if desc else label, inc))
+    return out
+
+
+def default_rubric(answer, max_score):
+    """默认给分点：先按分问拆大步骤；拆不出再按答案末尾分值细分。"""
+    parts = auto_part_rubric(answer, max_score)
+    if parts:
+        return parts
+    derived = auto_rubric_from_answer(answer, max_score)
+    if derived:
+        return parse_rubric_rules(derived, max_score)["scored"]
+    return []
+
+
+RUBRIC_RULE_WORDS = ("如果", "若", "最多", "至少", "不得", "否则", "只对", "只做",
+                     "没有", "未", "零分", "扣", "缺", "漏", "错", "不能", "只能", "注意", "说明")
+
+
+def parse_rubric_rules(text, max_score=None):
+    """把「给分点 + 评分说明」拆开，并识别可执行的硬规则。
+
+    返回：
+      scored: [(要点, 分值)]       真正参与合计的给分点
+      notes: [说明]                普通评分说明
+      score_cap: 12.0 / None       本题总分上限（如“最多只能得 12 分”）
+      cap_text: str                触发上限的原始说明
+      zero_rules: [说明]           “只对……得零分”这类零分规则
+
+    关键：评分说明里的数字不能被当成给分点的分值。
+    """
+    import re
+    scored, notes, zero_rules = [], [], []
+    score_cap, cap_text = None, ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
         if not line:
             continue
-        m = re.match(r"^(.*?)[\s|｜:：,，]*([0-9]+(?:\.[0-9]+)?)\s*分?\s*$", line)
+        # 1) 明确写了分隔符：要点｜2分 / 要点：2 / 要点, 2分
+        m = re.match(r"^(.*?)\s*[|｜:：,，]\s*([0-9]+(?:\.[0-9]+)?)\s*分?\s*$", line)
+        if m and m.group(1).strip(" |｜:：,，"):
+            scored.append((m.group(1).strip(" |｜:：,，"), float(m.group(2))))
+            continue
+        # 2) 没写分隔符：只接受短要点 + 末尾分值，且不能带条件/扣分说明
+        m = re.match(r"^(.{1,20}?)\s*[（(【\[]?\s*(?:得|给)?\s*([0-9]+(?:\.[0-9]+)?)\s*分\s*[)）】\]]?[。；;]?\s*$", line)
         if m and m.group(1).strip():
-            items.append((m.group(1).strip(" |｜:："), float(m.group(2))))
-        else:
-            items.append((line, None))
-    return items
+            point = m.group(1).strip()
+            if not any(w in point for w in RUBRIC_RULE_WORDS):
+                scored.append((point, float(m.group(2))))
+                continue
+        # 3) 总分上限：“最多只能得 12 分”“最高 12 分”“不超过 12 分”
+        cap = re.search(r"(?:最多|最高|至多|不超过|上限)\D{0,8}?([0-9]+(?:\.[0-9]+)?)\s*分", line)
+        if cap:
+            val = float(cap.group(1))
+            if max_score is None or val <= float(max_score) + 1e-9:
+                if score_cap is None or val < score_cap:
+                    score_cap = val
+                    cap_text = line
+                continue
+        # 4) 零分规则：“只对……得零分”“若……得 0 分”
+        if re.search(r"(零分|0\s*分)", line) and re.search(r"(只|仅|若|如果|没有|未|不能|否则)", line):
+            zero_rules.append(line)
+            continue
+        notes.append(line)
+    return {
+        "scored": scored,
+        "notes": notes,
+        "score_cap": score_cap,
+        "cap_text": cap_text,
+        "zero_rules": zero_rules,
+    }
 
 
 def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, half_point):
     """批改提示词：一次请求，看图直接判分。写得短而明确，模型输出也短，一份几秒出结果。"""
-    rubric = parse_rubric(rubric_text)
-    if rubric:
-        rows = "\n".join(f"{i+1}. {p}（{fmt_score(v) if v is not None else '?'}分）" for i, (p, v) in enumerate(rubric))
+    rules = parse_rubric_rules(rubric_text, max_score)
+    scored = rules["scored"]
+    if not scored:
+        scored = default_rubric(standard_answer, max_score)
+    if scored:
+        rows = "\n".join(f"{i+1}. {p}（{fmt_score(v)}分）" for i, (p, v) in enumerate(scored))
         rubric_part = f"给分点（按此逐条判，不增不减）：\n{rows}"
     else:
         rubric_part = "给分点：按参考答案中标注的步骤分逐条判；没标分值的，按步骤合理分配，合计等于满分。"
@@ -485,20 +721,26 @@ def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, 
 
 {rubric_part}
 
+重要：给分点里的中间式只是参考路径，不是必须逐字出现的得分条件。先整体看学生怎么做的；只要方法成立、能推出同一结论，就给该点满分。例如圆外一点作两条切线，直接写 (x₀−a)(x−a)+(y₀−b)(y−b)=r² 求切点弦，是完全正确的方法，不能因为没写“四点共圆、两圆相减”而扣分。
+
 判分要求：
 1. 只按图片里看得到的内容判，不替学生补步骤；字迹看不清影响判分时 unclear 填 true。
-2. 每个给分点：对了给满，错了或没写给0，部分对酌情给分，最小单位{step}分。
-3. 方法和参考答案不同但正确，同样给分，alt_method 填 true。
-4. 前一步错导致后面数值错、但后面方法对，后面酌情给分；只有结果没有过程，只给结果分。
+2. 每个给分点必须严格对照该点文字：写出该点要求的公式、方程或结论才给分；只写相关思路、没算出该点结果，最多给该点一半；该点结论错误不得给满；不因“思路对”给满，不补跳步，最小单位{step}分。
+3. 先判断学生实际用了什么方法，再逐点判。方法和参考答案不同但推理和结论正确，照样给满分，alt_method 填 true；不要因为没出现参考答案的中间式、或步骤顺序不同而扣分。求弦所在直线时，用极点极线、代入消元、两点式等都可以。
+4. 前一步错导致后面数值错、但后面方法对，后面按写出的步骤给分；只有结果没有过程，最多给该点满分的一半；有过程但跳步，按写出的步骤给分，不补跳步。
 5. 不因书写潦草（能看清的）或格式扣分。
+6. items 只列最终给分点，禁止输出“第(1)问合计”“小计”“总分”这类汇总行。
+7. 所有 full 相加必须正好等于 {fmt_score(max_score)} 分；拆不准就少拆几条，绝不能超过满分。
+8. 拿不准是否算完成该点时，按未完成处理；但已经明确写出的正确结论不能被否定。同一处错误只扣一次，不重复扣分。
 
 直接输出 JSON，不要任何别的文字，reason 不超过12字：
 {{"items":[{{"point":"给分点","full":分值,"got":得分,"reason":"理由"}}],"score":总分,"confidence":"高/中/低","unclear":false,"alt_method":false,"analysis":"一句话评语"}}"""
 
 
-def settle_score(result, max_score, half_point):
+def settle_score(result, max_score, half_point, score_cap=None):
     """按给分点加总得到最终分，并返回需要人工复核的原因列表"""
     import math
+    import re
     reasons = []
     items = []
     for it in result.get("items") or []:
@@ -517,8 +759,24 @@ def settle_score(result, max_score, half_point):
         return 0, items, reasons
 
     if items:
-        total = sum(i["got"] for i in items)
-        full_sum = sum(i["full"] for i in items)
+        sub_re = re.compile(r"(合计|小计|总分|总计|第\s*[（(]?[一二三1-3][)）]?\s*问\s*合计)")
+        subtotals = [i for i in items if sub_re.search(i["point"])]
+        sub_ids = {id(i) for i in subtotals}
+        details = [i for i in items if id(i) not in sub_ids]
+        scoring = items
+        if subtotals and abs(sum(i["full"] for i in subtotals) - float(max_score)) <= 0.01:
+            scoring = subtotals
+            reasons.append("模型给了小计行，已按小计计分")
+        elif details and abs(sum(i["full"] for i in details) - float(max_score)) <= 0.01:
+            scoring = details
+            if subtotals:
+                reasons.append("小计行合计≠满分，已忽略小计行")
+        elif subtotals:
+            scoring = details or items
+            reasons.append("小计行合计≠满分，请核对给分点")
+
+        total = sum(i["got"] for i in scoring)
+        full_sum = sum(i["full"] for i in scoring)
         if abs(full_sum - max_score) > 0.01:
             reasons.append(f"给分点合计 {fmt_score(full_sum)} 分≠满分")
         try:
@@ -537,6 +795,11 @@ def settle_score(result, max_score, half_point):
     total = max(0.0, min(total, float(max_score)))
     unit = 0.5 if half_point else 1.0
     total = math.floor(total / unit + 0.5 + 1e-9) * unit   # 四舍五入到最小单位
+    if score_cap is not None:
+        cap = max(0.0, min(float(score_cap), float(max_score)))
+        if total > cap + 1e-9:
+            reasons.append(f"按评分说明，本题最多 {fmt_score(cap)} 分（逐点合计 {fmt_score(total)}）")
+            total = math.floor(cap / unit + 1e-9) * unit   # 上限向下取整，绝不超上限
 
     conf = str(result.get("confidence", "")).strip()
     if conf.startswith("低") or conf.lower().startswith("low"):
@@ -546,6 +809,26 @@ def settle_score(result, max_score, half_point):
     if result.get("alt_method") is True:
         reasons.append("学生用了其他解法")
     return fmt_score(total), items, reasons
+
+
+def choose_consensus(samples):
+    """多次判分里选一次采用：3 次取中位数；2 次优先高把握，把握相同取较低分。"""
+    if not samples:
+        raise ValueError("没有可用的判分结果")
+
+    def conf_rank(sample):
+        c = str(sample[1].get("confidence", "")).strip()
+        return {"高": 2, "中": 1, "低": 0}.get(c[:1], 1)
+
+    if len(samples) >= 3:
+        ordered = sorted(samples, key=lambda x: (float(x[0]), -conf_rank(x)))
+        return ordered[len(ordered) // 2]
+    if len(samples) == 2:
+        r0, r1 = conf_rank(samples[0]), conf_rank(samples[1])
+        if r0 != r1:
+            return samples[0] if r0 > r1 else samples[1]
+        return min(samples, key=lambda x: float(x[0]))
+    return samples[0]
 
 
 def ink_ratio(img):
@@ -560,6 +843,72 @@ def ink_ratio(img):
         return 1.0  # 算不出来就当有内容，交给模型
 
 
+def color_ratio(img):
+    """彩色像素占比：课程表/网页通常很高，白底手写答卷很低。"""
+    try:
+        im = img.convert('HSV')
+        im.thumbnail((240, 240))
+        px = list(im.getdata())
+        colored = sum(1 for _, s, v in px if s > 70 and v > 60)
+        return colored / max(1, len(px))
+    except Exception:
+        return 0.0
+
+
+def trim_bottom_taskbar(img, max_ratio=0.18, min_px=24):
+    """裁掉答题截图底部的任务栏/浏览器工具栏。
+
+    只裁“又暗又彩”的连续底边：整行平均亮度明显低于卷面，且彩色像素较多。
+    学生手写是灰黑墨迹，不会让整行变暗，也不会让整行变彩，所以不会误裁。
+    返回 (裁剪后的图, 裁掉的像素高度)。
+    """
+    try:
+        h, w = img.height, img.width
+        if h < min_px * 3 or w < 20:
+            return img, 0
+        limit = max(min_px, int(h * max_ratio))
+        small = img.convert("HSV")
+        if small.width > 260:
+            nh = max(1, int(small.height * 260 / small.width))
+            small = small.resize((260, nh))
+        sw, sh = small.size
+        px = small.load()
+        row_v, row_c = [], []
+        for yy in range(sh):
+            vsum = colored = 0
+            for xx in range(sw):
+                _, s, v = px[xx, yy]
+                vsum += v
+                if s > 70 and v > 60:
+                    colored += 1
+            row_v.append(vsum / sw)
+            row_c.append(colored / sw)
+
+        upper = row_v[:max(1, int(sh * 0.7))]
+        upper_sorted = sorted(upper)
+        med_v = upper_sorted[len(upper_sorted) // 2]
+        dark_limit = min(190.0, med_v * 0.85)
+        start = max(0, sh - int(sh * max_ratio))
+        min_band = max(8, int(sh * 0.03))
+        cut_y = None
+        for y in range(start, max(start, sh - min_band + 1)):
+            n = sh - y
+            dark_frac = sum(1 for v in row_v[y:] if v < dark_limit) / n
+            color_frac = sum(1 for c in row_c[y:] if c > 0.02) / n
+            if dark_frac >= 0.90 and color_frac >= 0.05:
+                cut_y = y
+                break
+        if cut_y is None:
+            return img, 0
+        keep_h = int(round(cut_y * h / sh))
+        cut = h - keep_h
+        if cut < min_px or keep_h < min_px:
+            return img, 0
+        return img.crop((0, 0, w, keep_h)), cut
+    except Exception:
+        return img, 0
+
+
 
 class SimpleGradingUI:
     def __init__(self, root):
@@ -571,9 +920,10 @@ class SimpleGradingUI:
         self._main_thread = threading.current_thread()
         self.root.title(f"阅卷 V{APP_VERSION}")
         
-        self.root.geometry("300x800")
-        self.root.resizable(False, True)  # 宽度固定，高度可拖（小屏幕可以拉矮）
-        self.root.attributes('-topmost', True)  # 窗口置顶
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.root.geometry(f"380x{min(820, max(620, sh - 90))}+20+10")
+        self.root.minsize(340, 620)
+        self.root.resizable(True, True)
 
         
         # 配置文件固定放在程序目录（双击运行或从别的目录启动都能找到）
@@ -581,6 +931,7 @@ class SimpleGradingUI:
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zhixue_simple_config.json')
 
         self.answer_region = None
+        self.region_verified = False
         self.grading_count = 0
         self.total_time = 0
         self.is_grading = False
@@ -590,6 +941,7 @@ class SimpleGradingUI:
         self.next_button_pos = None  # 下一份按钮位置
         self.waiting_for_confirm = False  # 等待用户确认
         self.pending_score = None  # 待确认的分数
+        self._record = None
         self.score_input_box = None  # 分数输入框位置
         self.submit_button_pos = None  # 提交按钮位置
         
@@ -600,11 +952,14 @@ class SimpleGradingUI:
         self.saved_rubric = ""        # 给分点（每行：要点｜分值）
         self.half_point = False       # 是否允许 0.5 分
         self.blank_threshold = 0.0015 # 墨迹占比低于此值视为空白卷
+        self.grade_samples = 0        # 0=自动：Magpie/Custom 取 3 次，其它 1 次
+        self.keep_topmost = True      # 是否置顶（批改时可自动临时取消）
         
         self.save_timer = None # 自动保存定时器
 
         self.load_config()  # 加载配置 (必须在初始化变量之后)
         self.init_model()
+        self.root.attributes('-topmost', self.keep_topmost)
 
 
         self.create_widgets()  # 创建界面
@@ -631,6 +986,8 @@ class SimpleGradingUI:
 
     def on_closing(self):
         """窗口关闭时调用"""
+        if getattr(self, '_record', None):
+            self._save_record()
         self.save_config()
         self.root.destroy()
     
@@ -864,26 +1221,45 @@ class SimpleGradingUI:
             return
         T = self.THEME
         ans = self.answer_text.get('1.0', tk.END).strip()
-        items = parse_rubric(self.rubric_text.get('1.0', tk.END))
         try:
             mx = float(self.max_score_entry.get().strip() or 0)
         except ValueError:
             mx = 0
-        total = sum(v for _, v in items if v is not None)
+        rules = parse_rubric_rules(self.rubric_text.get('1.0', tk.END), mx)
+        scored = rules["scored"]
+        source = "manual"
+        if not scored and mx:
+            scored = default_rubric(ans, mx)
+            if scored:
+                source = "auto"
+        total = sum(v for _, v in scored)
         line1 = f"参考答案 {len(ans)} 字" if ans else "参考答案：未填写"
-        if items:
+        if scored:
             ok = abs(total - mx) < 0.01
-            line2 = f"给分点 {len(items)} 条 {fmt_score(total)} 分" + (" ✓" if ok else f" ≠ 满分{fmt_score(mx)}")
+            line2 = f"给分点 {len(scored)} 条 {fmt_score(total)} 分" + (" ✓" if ok else f" ≠ 满分{fmt_score(mx)}")
+            if source == "auto":
+                line2 += "（从答案自动拆）"
         else:
             ok = True
             line2 = "给分点：未填，由 AI 拆分"
+        if rules["score_cap"] is not None:
+            line2 += f" · 上限{fmt_score(rules['score_cap'])}分"
+        if rules["zero_rules"]:
+            line2 += f" · 零分规则{len(rules['zero_rules'])}条"
+        if rules["notes"]:
+            line2 += f" · 说明{len(rules['notes'])}条"
         self.answer_summary.config(text=line1 + "\n" + line2, fg=T['text'] if (ans and ok) else T['danger'])
         if hasattr(self, 'editor_title'):
             q = self.question_num_entry.get().strip() or "?"
             self.editor_title.config(text=f"第 {q} 题 · 满分 {fmt_score(mx) if mx else '?'} 分")
         if hasattr(self, 'rubric_status'):
-            if items:
-                self.rubric_status.config(text=f"合计 {fmt_score(total)} / {fmt_score(mx)} 分  " + ("✓ 与满分一致" if ok else "✗ 与满分不一致"),
+            if scored:
+                status_text = f"合计 {fmt_score(total)} / {fmt_score(mx)} 分  " + ("✓ 与满分一致" if ok else "✗ 与满分不一致")
+                if source == "auto":
+                    status_text += "（从答案自动拆）"
+                if rules["score_cap"] is not None:
+                    status_text += f" · 总分上限 {fmt_score(rules['score_cap'])} 分"
+                self.rubric_status.config(text=status_text,
                                           fg=T['ok'] if ok else T['danger'])
             else:
                 self.rubric_status.config(text="", fg=T['sub'])
@@ -904,6 +1280,8 @@ class SimpleGradingUI:
 
         tools = tk.Frame(bar, bg=T['head'], height=self.ROW_H)
         tools.pack(side=tk.RIGHT, padx=10)
+        self.topmost_btn = self._small(tools, "置顶", self.toggle_topmost,
+                                       T['head2'], 'white', T['head_a'], width=42)
         self.update_btn = self._small(tools, "更新", lambda: self.check_update_ui(silent=False),
                                       T['head2'], 'white', T['head_a'], width=42)
         self._small(tools, "笔记", self.setup_obsidian_path, T['head2'], 'white', T['head_a'], padx=4, width=42)
@@ -924,6 +1302,7 @@ class SimpleGradingUI:
         _, body = self._card(main_frame, "① 答题区域", color=T['cyan'])
         r = self._row(body, gap=0)
         self._small(r, "框选", self.setup_region, T['cyan'], 'white', '#0097B2')
+        self._small(r, "预览", self.preview_region, T['cyan'], 'white', '#0097B2', padx=(0, 6))
         slot = self._slot(r, side=tk.LEFT, padx=(0, 6), expand=True)
         self.region_preview = tk.Label(slot, text="未框选", bg='#E6F9FD', fg=T['sub'], font=(F, 8), anchor='w', padx=8)
         self.region_preview.pack(fill=tk.BOTH, expand=True)
@@ -963,7 +1342,7 @@ class SimpleGradingUI:
             w.bind('<KeyRelease>', lambda e: (self.save_question_data(), self.refresh_answer_summary()))
 
         # ===== ③ 批改控制 =====
-        _, body = self._card(main_frame, "③ 批改", hint="空格 开始 · Esc 停止", color=T['orange'])
+        _, body = self._card(main_frame, "③ 批改", hint="空格 开始 · Esc 停止 · 目标<20秒", color=T['orange'])
         big = tk.Frame(body, bg=T['card'], height=self.BIG_H)
         big.pack_propagate(False)
         big.pack(fill=tk.X, pady=(0, 8))
@@ -1007,14 +1386,18 @@ class SimpleGradingUI:
         _, body = self._card(main_frame, "④ 结果", expand=True, color=T['green'])
         self.current_result_frame = tk.Frame(body, bg=T['tint'])
         self.current_result_frame.pack(fill=tk.X, pady=(0, 8))
-        self.current_score_label = tk.Label(self.current_result_frame, text="建议分数  --", font=(F, 14, 'bold'),
+        self.current_score_label = tk.Label(self.current_result_frame, text="建议分数  --", font=(F, 12, 'bold'),
                                             bg=T['tint'], fg=T['primary'])
-        self.current_score_label.pack(pady=(6, 0))
+        self.current_score_label.pack(pady=(4, 0))
         self.current_analysis_label = tk.Label(self.current_result_frame, text="", font=(F, 8), bg=T['tint'],
-                                               fg=T['sub'], wraplength=240, justify=tk.LEFT)
+                                               fg=T['sub'], wraplength=330, justify=tk.LEFT)
         self.current_analysis_label.pack(pady=(2, 6), padx=8)
+        self.capture_thumb = tk.Label(self.current_result_frame, text="截图预览", font=(F, 7),
+                                      bg=T['tint'], fg=T['sub'], cursor='hand2')
+        self.capture_thumb.pack(pady=(0, 6))
+        self.capture_thumb.bind('<Button-1>', lambda e: self.preview_region())
 
-        self.result_text = scrolledtext.ScrolledText(body, height=10, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
+        self.result_text = scrolledtext.ScrolledText(body, height=10, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
                                                      bg=T['input'], fg=T['sub'], highlightthickness=1,
                                                      highlightbackground=T['line'])
         self.result_text.pack(fill=tk.BOTH, expand=True)
@@ -1062,6 +1445,10 @@ class SimpleGradingUI:
             
         # 4. 区域设置状态
         self.update_region_preview()
+        if hasattr(self, 'topmost_btn'):
+            self.topmost_btn.config(
+                text="置顶" if self.keep_topmost else "不置顶",
+                bg=self.THEME['head2'] if self.keep_topmost else self.THEME['head_a'])
         
         # 5. 自动提交设置状态
         if self.score_input_box and self.submit_button_pos:
@@ -1079,11 +1466,12 @@ class SimpleGradingUI:
         
         def on_region_selected(region):
             self.answer_region = region
+            self.region_verified = False
             self.save_config()
             self.update_region_preview()
             self.root.deiconify()
             self.log(f"✓ 答案区域已设置: {region[2]}x{region[3]}")
-            messagebox.showinfo("成功", "答案区域设置成功！")
+            self.preview_region()
         
         selector = ScreenshotSelector(on_region_selected)
         selector.start()
@@ -1130,10 +1518,70 @@ class SimpleGradingUI:
         """更新区域预览"""
         if self.answer_region:
             x, y, w, h = self.answer_region
-            self.region_preview.config(text=f"✓ 已框选  {w}×{h}", fg=self.THEME['ok'], bg=self.THEME['ok_bg'])
+            if self.region_verified:
+                self.region_preview.config(text=f"✓ 已预览  {w}×{h}", fg=self.THEME['ok'], bg=self.THEME['ok_bg'])
+            else:
+                self.region_preview.config(text=f"⚠ 已框选 {w}×{h} · 点「预览」检查",
+                                           fg=self.THEME['warn'], bg='#FFF4E6')
+
+    def toggle_topmost(self):
+        """置顶开关：开启后批改、提交、连续批改都保持在其他窗口上方。"""
+        self.keep_topmost = not self.keep_topmost
+        self.root.attributes('-topmost', self.keep_topmost)
+        self.topmost_btn.config(
+            text="置顶" if self.keep_topmost else "不置顶",
+            bg=self.THEME['head2'] if self.keep_topmost else self.THEME['head_a'])
+        self.save_config()
+
+    def preview_region(self):
+        """预览当前框选的答题区域，防止截到课程表或黑屏。"""
+        if not self.answer_region:
+            messagebox.showwarning("预览", "请先点「框选」设置答题区域")
+            return
+        x, y, w, h = self.answer_region
+        pad = 6
+        sw, sh = pyautogui.size()
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.35)
+        try:
+            img = pyautogui.screenshot(region=(
+                max(0, x - pad), max(0, y - pad),
+                min(sw, x + w + pad) - max(0, x - pad),
+                min(sh, y + h + pad) - max(0, y - pad)))
+        finally:
+            self.root.deiconify()
+        self.region_verified = True
+        self.update_region_preview()
+
+        win = tk.Toplevel(self.root)
+        win.title("答题区域预览")
+        win.configure(bg=self.THEME['bg'])
+        win.attributes('-topmost', True)
+        win.geometry("760x640")
+
+        show = img.copy()
+        show.thumbnail((720, 520))
+        self._preview_img = ImageTk.PhotoImage(show)
+        tk.Label(win, image=self._preview_img, bg=self.THEME['bg']).pack(padx=12, pady=(12, 6))
+        color = color_ratio(img)
+        warn = color > 0.25
+        tk.Label(win, text=(f"区域 {w}×{h} · 墨迹 {ink_ratio(img):.3f} · 彩色 {color:.0%}"
+                            + ("　⚠ 这看起来像课程表/网页，不是答卷！" if warn else "")
+                            + "\n如果这里看到课程表、黑屏或被遮挡，请重新框选"),
+                 font=(self.FONT, 9), bg=self.THEME['bg'],
+                 fg=self.THEME['danger'] if warn else self.THEME['sub']).pack(pady=(0, 8))
+
+        row = tk.Frame(win, bg=self.THEME['bg'])
+        row.pack(pady=(0, 12))
+        tk.Button(row, text="重新框选", command=lambda: (win.destroy(), self.setup_region()),
+                  bg=self.THEME['cyan'], fg='white', relief=tk.FLAT, padx=18, pady=6).pack(side=tk.LEFT, padx=8)
+        tk.Button(row, text="关闭", command=win.destroy,
+                  bg=self.THEME['line'], fg=self.THEME['text'], relief=tk.FLAT, padx=24, pady=6).pack(side=tk.LEFT, padx=8)
     
     def grade_answer(self):
         """批改答案"""
+        self._raise_window()
         if self.is_grading:
             self.log("⚠ 正在批改中，请稍候...")
             return
@@ -1152,14 +1600,17 @@ class SimpleGradingUI:
             return
         
         # 给分点合计和满分对不上：先提醒（只在手动点开始时问，连续批改时不打断）
-        items = parse_rubric(self.rubric_text.get('1.0', tk.END))
-        if items and not self.auto_continue:
-            try:
-                mx = float(self.max_score_entry.get().strip())
-            except ValueError:
-                mx = None
-            total = sum(v for _, v in items if v is not None)
-            if mx is not None and abs(total - mx) > 0.01:
+        try:
+            mx = float(self.max_score_entry.get().strip())
+        except ValueError:
+            mx = None
+        rules = parse_rubric_rules(self.rubric_text.get('1.0', tk.END), mx)
+        scored = rules["scored"]
+        if not scored and mx:
+            scored = default_rubric(answer_text, mx)
+        if scored and not self.auto_continue and mx is not None:
+            total = sum(v for _, v in scored)
+            if abs(total - mx) > 0.01:
                 if messagebox.askyesno("给分点和满分对不上",
                                        f"给分点合计 {fmt_score(total)} 分，满分是 {fmt_score(mx)} 分。\n\n"
                                        "点「是」打开编辑窗口修改；点「否」照样批改（每份都会要求人工确认）。"):
@@ -1196,15 +1647,16 @@ class SimpleGradingUI:
             start_time = time.time()
             
             question_num = self.question_num_entry.get().strip()
-            max_score = float(self.max_score_entry.get().strip() or "10")
-            if max_score == int(max_score):
-                max_score = int(max_score)
+            max_score_f = float(self.max_score_entry.get().strip() or "10")
+            max_score = int(max_score_f) if max_score_f == int(max_score_f) else max_score_f
             standard_answer = self.answer_text.get('1.0', tk.END).strip()
             
             self.root.after(0, lambda: self.log(f"\n[{datetime.now().strftime('%H:%M:%S')}] 批改题号{question_num}..."))
             
             # 截取学生答案
             x, y, w, h = self.answer_region
+            if w < 40 or h < 40:
+                raise Exception(f"答题区域太小（{w}×{h}），请重新框选")
             # 四周多留 6 像素，避免切掉最后一行或边上的字
             sw, sh = pyautogui.size()
             pad = 6
@@ -1219,46 +1671,96 @@ class SimpleGradingUI:
                 raise Exception("答案区域和上一份完全相同（可能没翻页或已批完），已停止自动连续批改")
             self.last_img_hash = img_hash
             self.current_student_img = student_img # 保存引用以供导出
-            
-            # —— 以下批改逻辑与原版（初始版本）一致：图片 + 提示词一次发给模型，直接返回结果 ——
-            rubric = self.rubric_text.get('1.0', tk.END).strip()
-            answer_part = standard_answer + (f"\n给分点：\n{rubric}" if rubric else "")
-            prompt = f"""你是严谨的判卷老师，请严格按照【参考答案】中的评分标准（步骤分）批改这道题。
+            grade_img, trimmed = trim_bottom_taskbar(student_img)
+            if trimmed:
+                self.log(f"  ✂ 已裁掉底部任务栏 {trimmed}px，避免干扰识图")
 
-题号：{question_num}
-满分：{max_score}分
-参考答案：
-{answer_part}
+            ink = ink_ratio(grade_img)
+            color = color_ratio(grade_img)
+            if ink > 0.97:
+                raise Exception(f"截图几乎全黑（墨迹占比 {ink:.2f}），可能答题区域被遮挡或没翻页")
+            if color > 0.25:
+                raise Exception(f"截图看起来是彩色页面（彩色像素 {color:.0%}），不是学生答卷；请点「预览」重新框选")
+            extra_reasons = []
+            if color > 0.10:
+                extra_reasons.append(f"截图彩色像素较多（{color:.0%}），请确认不是课程表/网页")
 
-图片是学生的答案。
+            # 空白卷直接 0 分，不浪费 API 额度
+            if ink < self.blank_threshold:
+                result = {
+                    "score": 0, "items": [], "blank": True, "confidence": "高",
+                    "unclear": False, "alt_method": False,
+                    "analysis": f"答题区域几乎是空白（墨迹占比 {ink:.4f}），按 0 分。",
+                }
+                score, items, reasons = settle_score(result, max_score_f, self.half_point)
+                self.log(f"  ⚪ 空白卷，直接记 0 分（墨迹 {ink:.4f}）")
+            else:
+                rubric = self.rubric_text.get('1.0', tk.END).strip()
+                rules = parse_rubric_rules(rubric, max_score_f)
+                if rules["scored"]:
+                    self.log(f"  📋 给分点 {len(rules['scored'])} 条，合计 "
+                             f"{fmt_score(sum(v for _, v in rules['scored']))} 分")
+                else:
+                    derived_scored = default_rubric(standard_answer, max_score_f)
+                    if derived_scored:
+                        vals = [v for _, v in derived_scored]
+                        self.log(f"  📋 已从参考答案自动拆出给分点：{' + '.join(str(fmt_score(v)) for v in vals)}")
+                if rules["score_cap"] is not None:
+                    self.log(f"  📏 评分规则：本题最多 {fmt_score(rules['score_cap'])} 分（程序强制）"
+                             f"（{rules['cap_text'][:50]}）")
+                if rules["zero_rules"]:
+                    self.log(f"  📏 零分规则 {len(rules['zero_rules'])} 条（请人工复核对应步骤）")
+                prompt = build_grading_prompt(question_num, max_score, standard_answer, rubric,
+                                              self.half_point)
+                # 多次取样：单次判分波动大，固定取 3 次，按中位数采用，避免取最高分导致偏松
+                provider = str(self.config.get('provider', '')).lower()
+                default_samples = 3 if provider in ('magpie', 'custom') else 1
+                max_samples = int(getattr(self, 'grade_samples', 0) or default_samples)
+                max_samples = max(1, min(3, max_samples))
+                samples = []
+                target = max_samples
+                deadline = start_time + 18
+                while len(samples) < target:
+                    if samples and time.time() > deadline - 4:
+                        break
+                    try:
+                        r = self.call_ai_api(prompt, grade_img, need_json=True)
+                    except Exception as e:
+                        if samples:
+                            self.log(f"  ⚠ 第 {len(samples) + 1} 次判分失败：{str(e)[:80]}，使用已有结果")
+                            break
+                        raise
+                    s, its, rs = settle_score(r, max_score_f, self.half_point, rules["score_cap"])
+                    r['score'] = s
+                    r['items'] = its
+                    samples.append((s, r, its, rs))
+                    self.log(f"  🧪 第 {len(samples)} 次判分：{fmt_score(s)} 分")
+                if not samples:
+                    raise Exception("模型没有返回可用分数")
+                totals = [x[0] for x in samples]
+                chosen = choose_consensus(samples)
+                score, result, items, reasons = chosen
+                if len(samples) > 1:
+                    method = "中位数" if len(samples) >= 3 else "把握度优先/较低分"
+                    self.log(f"  🧪 多次判分：{'/'.join(str(fmt_score(t)) for t in totals)}"
+                             f" → 采用{method} {fmt_score(score)} 分")
+                    if max(totals) - min(totals) >= 2:
+                        reasons.append(f"多次判分差异较大（{'/'.join(str(fmt_score(t)) for t in totals)}），"
+                                       f"取中位数 {fmt_score(score)}，请复核")
+                if ink > 0.90:
+                    reasons.append(f"截图墨迹占比很高（{ink:.2f}），请确认不是黑屏/遮挡")
+                result['score'] = score
+                result['items'] = items
 
-请仔细对比学生答案与参考答案，严格判定每一步是否正确。如果是步骤给分题，必须检查学生是否写出了关键步骤。
-如果学生答案与参考答案不仅仅是格式不同，而是逻辑或数值错误，必须扣分。
-
-按以下JSON格式返回：
-{{
-    "student_answer": "学生写的答案内容（简述）",
-    "score": 得分数字,
-    "deduction_details": [
-        {{"point": "具体扣分原因（如：未化简、计算错误、步骤缺失）", "deduction": 扣分值}}
-    ],
-    "analysis": "详细评语（指出哪里错了，为什么扣分）"
-}}
-
-严厉评分规则：
-1. 总分不能超过满分，不能低于0分。
-2. 必须严格执行参考答案中的给分点，步骤缺失扣步骤分。
-3. 严格计算最终得分 = 满分 - 扣分总和。
-
-只返回JSON，不要其他内容。"""
-
-            result = self.call_ai_api(prompt, student_img, need_json=True)
+            result['_reasons'] = (reasons or []) + extra_reasons
+            result['_ink'] = round(ink, 4)
+            result['_color'] = round(color, 3)
 
             elapsed = time.time() - start_time
             self.grading_count += 1
             self.total_time += elapsed
 
-            model_name = self.config.get('model_name', 'Unknown')
+            model_name = getattr(self, '_last_model_used', None) or self.config.get('model_name', 'Unknown')
             self.root.after(0, lambda: self.display_result(result, max_score, elapsed, model_name))
             
         except Exception as e:
@@ -1274,7 +1776,7 @@ class SimpleGradingUI:
                 self.root.after(0, lambda: self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT))
     
     def display_result(self, result, max_score, elapsed, model_name="Unknown"):
-        """显示结果（原版逻辑）"""
+        """显示结果：逐给分点得分 + 需复核原因"""
         try:
             score = float(result.get('score', 0))
         except (TypeError, ValueError):
@@ -1282,47 +1784,150 @@ class SimpleGradingUI:
         score = fmt_score(max(0, min(score, float(max_score))))   # 不超过满分、不低于 0
         result['score'] = score
         analysis = result.get('analysis', '')
+        items = result.get('items') or []
+        reasons = result.get('_reasons') or []
         deductions = result.get('deduction_details', []) or []
 
         self.current_score_label.config(text=f"建议分数  {score} / {max_score}")
 
         detail_text = f"评语: {analysis}\n"
-        if deductions:
+        if items:
+            detail_text += "\n给分点:\n"
+            for it in items:
+                got, full = it.get('got', 0), it.get('full', 0)
+                reason = str(it.get('reason', '') or '').strip()
+                detail_text += f"  • {it.get('point', '')}  {fmt_score(got)}/{fmt_score(full)}"
+                if reason:
+                    detail_text += f"  {reason}"
+                detail_text += "\n"
+        elif deductions:
             detail_text += "\n扣分详情:\n"
             for d in deductions:
                 if isinstance(d, dict):
                     detail_text += f"  • {d.get('point', '未命名扣分点')}: -{d.get('deduction', 0)}分\n"
+        if reasons:
+            detail_text += "\n⚠ 需人工复核:\n" + "\n".join(f"  • {r}" for r in reasons)
 
-        self.current_analysis_label.config(text=detail_text)
+        self.current_analysis_label.config(text=f"评语: {analysis}")
+        self.log(detail_text)
+        try:
+            thumb = self.current_student_img.copy()
+            thumb.thumbnail((110, 66))
+            self._thumb_img = ImageTk.PhotoImage(thumb)
+            self.capture_thumb.config(image=self._thumb_img, text="")
+        except Exception:
+            pass
 
         self.log(f"  得分: {score}/{max_score} 用时: {elapsed:.1f}s ({model_name})")
         self.log(f"\n💡 建议分数: {score} 分")
 
         self.update_stats()
         avg_time = self.total_time / self.grading_count if self.grading_count > 0 else 0
-        if hasattr(self, 'obsidian_path') and self.obsidian_path:
-            self.save_to_obsidian(result, max_score, self.current_student_img, model_name, elapsed, avg_time)
-        self.save_to_html(result, max_score, self.current_student_img, model_name, elapsed, avg_time)
+        self._record = (result, max_score, model_name, elapsed, avg_time)
 
         self.waiting_for_confirm = True
         self.pending_score = score
-        self.show_confirm_dialog(score, max_score, detail_text)
+        self._raise_window()
+        self.show_confirm_dialog(score, max_score, detail_text, force=bool(reasons))
+
+    def _save_record(self):
+        """在用户确认/改分后保存记录，保证 HTML/笔记里的分数是最终提交分。"""
+        rec = getattr(self, '_record', None)
+        if not rec:
+            return
+        self._record = None
+        result, max_score, model_name, elapsed, avg_time = rec
+        try:
+            if hasattr(self, 'obsidian_path') and self.obsidian_path:
+                self.save_to_obsidian(result, max_score, self.current_student_img, model_name, elapsed, avg_time)
+            self.save_to_html(result, max_score, self.current_student_img, model_name, elapsed, avg_time)
+        except Exception as e:
+            self.log(f"⚠ 保存记录失败: {e}")
 
     def init_model(self):
-        """初始化模型"""
-        provider = self.config.get('provider', 'Gemini')
-        api_key = self.config.get('api_key', '')
-        
-        if provider == 'Gemini':
-            if api_key:
-                genai.configure(api_key=api_key)
-            try:
-                self.model = genai.GenerativeModel(self.config.get('model_name', 'gemini-2.5-flash'))
-            except:
-                pass
-        
+        """REST 直连，不再依赖已停止维护的 google.generativeai SDK。"""
+        self.model = None
+
     def call_ai_api(self, prompt, image, need_json=True):
-        """统一调用AI接口"""
+        """调用当前提供商；额度/限流时自动回退到本机 Magpie。"""
+        try:
+            return self._call_ai_api_once(prompt, image, need_json)
+        except Exception as e:
+            m = str(e).lower()
+            if 'timed out' in m or 'timeout' in m or '超过' in m:
+                raise Exception(f"单题超过 {GRADE_TIMEOUT} 秒，已中止（请换更快的模型或检查网络）") from e
+            if self.config.get('provider') == 'Magpie':
+                gs = (self.provider_settings or {}).get('Gemini', {})
+                if gs.get('api_key'):
+                    self.log(f"  ↪ Magpie 不可用（{str(e).splitlines()[0][:60]}）；改用 Gemini…")
+                    return self._call_provider_with_settings('Gemini', gs, prompt, image, need_json)
+                raise
+            if not self._should_fallback(e):
+                raise
+            self.log(f"  ↪ {str(e).splitlines()[0][:80]}；自动改用本机 Magpie…")
+            try:
+                return self._call_magpie_fallback(prompt, image, need_json)
+            except Exception as e2:
+                raise Exception(f"{e}\n\n本机 Magpie 回退也失败：{e2}") from e2
+
+    def _call_provider_with_settings(self, provider, settings, prompt, image, need_json):
+        """临时切换到另一个提供商调用，结束后恢复原配置。"""
+        old = dict(self.config)
+        try:
+            self.config.update(
+                provider=provider,
+                api_key=settings.get('api_key', ''),
+                base_url=settings.get('base_url', '') or PROVIDERS.get(provider, {}).get('base_url', ''),
+                model_name=settings.get('model_name', '')
+                or (PROVIDERS.get(provider, {}).get('models') or [''])[0],
+            )
+            return self._call_ai_api_once(prompt, image, need_json)
+        finally:
+            self.config = old
+
+    @staticmethod
+    def _should_fallback(err):
+        m = str(err).lower()
+        return any(k in m for k in (
+            "quota", "429", "exceeded", "rate limit", "resource_exhausted",
+            "额度", "key 池全部不可用", "no available key", "unavailable",
+        ))
+
+    def _call_magpie_fallback(self, prompt, image, need_json):
+        base, ver = magpie_detect()
+        if not base:
+            raise Exception("本机 Magpie 未运行（127.0.0.1:3425）。请打开 magpie，或在「模型」里换一个可用提供商")
+        key = PROVIDERS['Magpie']['default_key']
+        models = fetch_models(base, key)
+        model = choose_magpie_model(models)
+        if not model:
+            raise Exception("Magpie 没有可用模型")
+        self.log(f"  ↪ 本机 Magpie：{model}")
+        self._last_model_used = f"Magpie/{model}"
+        return self._openai_vision_call(base, key, model, prompt, image, need_json)
+
+    def _openai_vision_call(self, base_url, api_key, model, prompt, image, need_json):
+        """OpenAI 兼容的识图调用：灰度压缩 + 流式 + 自动关思考。"""
+        if not base_url or not model:
+            raise Exception("API 地址或模型名为空")
+        data_url = image_to_data_url(image, max_side=1600)
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]}],
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+        data.update(no_think_params(model, base_url))
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        text = post_chat_stream(url, data, headers, log=self.log, timeout=GRADE_TIMEOUT)
+        return self.parse_json_result(text) if need_json else text
+        
+    def _call_ai_api_once(self, prompt, image, need_json=True):
+        """单次调用当前提供商（内部方法）。"""
         provider = self.config.get('provider', 'Gemini')
         api_key = self.config.get('api_key', '')
         base_url = self.config.get('base_url', '')
@@ -1334,12 +1939,101 @@ class SimpleGradingUI:
                  api_key = DEFAULT_CONFIG['api_key']
         
         if provider == 'Gemini':
-            # Gemini 必须先初始化 self.model
-            if not hasattr(self, 'model'):
-                self.init_model()
-            response = self.model.generate_content([prompt, image])
-            text = response.text
-            return self.parse_json_result(text) if need_json else text
+            # 2026-11-11 v2：key 池轮换 + 熔断。keys.json 里有池就用池；没有则回退单 key + 重试
+            import urllib.request
+            import json as _json
+            img_io = io.BytesIO()
+            im = image.convert("RGB")
+            im.thumbnail((1600, 1600))
+            im.save(img_io, format="JPEG", quality=88)
+            img_b64 = base64.b64encode(img_io.getvalue()).decode()
+            gen_cfg = {"temperature": 0.1,
+                       "responseMimeType": "application/json" if need_json else "text/plain"}
+            if 'gemini-2.5' in (model_name or '') and 'pro' not in (model_name or ''):
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+            body = _json.dumps({
+                "contents": [{"parts": [
+                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
+                    {"text": prompt}]}],
+                "generationConfig": gen_cfg,
+            }).encode("utf-8")
+
+            alive, kp = keys_status()
+            if kp is not None and not alive:
+                # 池存在但全冷却：等最近恢复的那个 key（最多90秒），这比回退到已耗尽的旧单key强
+                wait = min(kp.get("cooldown", {}).values()) - time.time()
+                if 0 < wait <= 90:
+                    self.log(f"  [key池] 全部冷却中，等待最近恢复 {wait:.0f}s…")
+                    time.sleep(wait + 1)
+                    alive, kp = keys_status()
+            if not kp or not alive:
+                # 无池或池全部冷却：先用配置里的单 key 试一次；429 立即交给外层回退 Magpie
+                if not api_key:
+                    raise QuotaError("Gemini 未填 API Key，且 keys.json 无可用 key")
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        text, usage = gemini_request_raw(api_key, model_name, body, GRADE_TIMEOUT)
+                        self._last_model_used = f"Gemini/{model_name or 'gemini-2.5-flash'}"
+                        return self.parse_json_result(text) if need_json else text
+                    except urllib.error.HTTPError as e:
+                        error_body = e.read().decode("utf-8", "ignore")
+                        last_err = f"Gemini API Error {e.code}: {error_body[:200]}"
+                        if e.code == 429:
+                            raise QuotaError(last_err)
+                        if e.code in (500, 503):
+                            time.sleep(2 * (attempt + 1)); continue
+                        raise Exception(last_err)
+                    except Exception as e:
+                        last_err = f"Gemini Call Failed: {str(e)[:200]}"
+                        time.sleep(2 * (attempt + 1))
+                raise QuotaError(last_err or "Gemini 调用失败")
+
+            # —— 有池：轮换 + 熔断，不 sleep 干等 ——
+            tried = 0; last_err = None
+            while alive and tried < len(alive) + 2:
+                k = alive[tried % len(alive)]
+                tried += 1
+                try:
+                    text, usage = gemini_request_raw(k, model_name, body, GRADE_TIMEOUT)
+                    self._last_model_used = f"Gemini/{model_name or 'gemini-2.5-flash'}"
+                    self.log(f"  [key池] 本次使用 #{(kp.get('pool',[]).index(k)+1) if k in kp.get('pool',[]) else '?'} 号key")
+                    return self.parse_json_result(text) if need_json else text
+                except urllib.error.HTTPError as e:
+                    error_body = e.read().decode("utf-8", "ignore")
+                    if e.code == 429:
+                        # 区分分钟限流(RPM,冷却65s)和日限流(RPD,冷却到明早)：按 retryDelay 精确冷却
+                        import re as _re
+                        mm = _re.search(r'"retryDelay":\s*"(\d+)s"', error_body)
+                        delay = int(mm.group(1)) if mm else 65
+                        if delay > 3600:   # 日额度用尽，冷却到明天重置（约8小时后），不再无谓重试
+                            keys_cooldown(kp, k, min(delay + 60, 8 * 3600))
+                            self.log(f"  [key池] #{kp.get('pool',[]).index(k)+1} 日额度用尽，冷却到明早")
+                        else:
+                            keys_cooldown(kp, k, delay + 5)
+                        alive, kp = keys_status()
+                        last_err = GEMINI_429_HINT
+                        continue
+                    elif e.code in (401, 403, 404):
+                        # key 失效：拉黑（写入 banned，本次运行不再用）
+                        kp.setdefault("banned", []).append(k)
+                        kp["pool"] = [x for x in kp.get("pool", []) if x != k]
+                        try:
+                            json.dump(kp, open(KEYS_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+                        except Exception:
+                            pass
+                        alive, kp = keys_status()
+                        last_err = f"key 失效({e.code})已拉黑: {k[:10]}***"
+                        continue
+                    else:
+                        last_err = f"Gemini API Error {e.code}: {error_body[:200]}"
+                        time.sleep(1.5)
+                        continue
+                except Exception as e:
+                    last_err = f"Gemini Call Failed: {str(e)[:200]}"
+                    time.sleep(1.5)
+                    continue
+            raise QuotaError(f"Gemini key 池全部不可用。{last_err or GEMINI_429_HINT}")
 
         if True:
             # 智能检测：如果模型不支持 Vision (如 DeepSeek-V3/Chat)，且在 SiliconFlow，则使用 Qwen-VL "借眼"
@@ -1375,35 +2069,10 @@ class SimpleGradingUI:
                     api_key = PROVIDERS['Magpie']['default_key']
                 if not model_name:
                     raise Exception("Magpie 未选择模型：请在“模型设置”里点“获取模型”并选一个能识图的模型")
-            
-            import urllib.request
-            import urllib.error
-            import json
-            
-            # 转换图片为Base64（原版：PNG 原图）
-            buffered = io.BytesIO()
-            image.save(buffered, format="PNG")
-            img_str = base64.b64encode(buffered.getvalue()).decode()
-
-            url = f"{base_url.rstrip('/')}/chat/completions"
-            messages = [{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}},
-            ]}]
-            data = {"model": model_name, "messages": messages, "max_tokens": 4096}
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-
-            try:
-                req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-                with http_open(req) as response:
-                    result_json = json.loads(response.read().decode('utf-8'))
-                    content = result_json['choices'][0]['message']['content']
-                    return self.parse_json_result(content) if need_json else content
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode('utf-8', 'ignore')
-                raise Exception(f"API Error {e.code}: {error_body}")
-            except Exception as e:
-                raise Exception(f"API Call Failed: {str(e)}")
+            if not base_url:
+                raise Exception(f"{provider} 未设置 API 地址")
+            self._last_model_used = f"{provider}/{model_name}"
+            return self._openai_vision_call(base_url, api_key, model_name, prompt, image, need_json)
 
     def _call_siliconflow_vision(self, api_key, model, prompt, image):
         """内部辅助：调用 SiliconFlow 的 Vision 模型进行 OCR"""
@@ -1589,7 +2258,11 @@ class SimpleGradingUI:
                 status_lbl.config(text=f"❌ 获取失败：{e}", fg='#c00')
                 return
             model_combo['values'] = models
-            if models and model_combo.get() not in models:
+            if p == 'Magpie':
+                preferred = choose_magpie_model(models)
+                if preferred and (not model_combo.get() or model_combo.get() == 'group/group'):
+                    model_combo.set(preferred)
+            elif models and model_combo.get() not in models:
                 model_combo.set(models[0])
             status_lbl.config(text=f"✓ 获取到 {len(models)} 个模型（批改需选能识图的模型）", fg='#2e7d32')
 
@@ -1685,35 +2358,41 @@ class SimpleGradingUI:
         """设置自动提交位置"""
         msg = "即将设置自动提交位置\n\n"
         msg += "需要设置2个位置：\n"
-        msg += "1. 红色框内的分数输入框\n"
-        msg += "2. 绿色的'提交分数'按钮\n\n"
-        msg += "每个位置设置时间：5秒"
+        msg += "1. 分数输入框\n"
+        msg += "2. 提交分数按钮\n\n"
+        msg += "主窗口会先隐藏，屏幕顶部会出现倒计时小条。\n每个位置 5 秒。"
         
         if not messagebox.askokcancel("设置自动提交", msg):
             return
         
         self.log("\n开始设置自动提交位置...")
-        
-        # 设置分数输入框
-        self.log("\n5秒后，请将鼠标移到【红色框内的分数输入框】")
-        for i in range(5, 0, -1):
-            self.log(f"{i}...")
-            self.root.update()
-            time.sleep(1)
-        
-        self.score_input_box = pyautogui.position()
+
+        self.root.withdraw()
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes('-topmost', True)
+        tip.configure(bg=self.THEME['head'])
+        sw, sh = pyautogui.size()
+        tip.geometry(f"460x92+{max(0, sw // 2 - 230)}+40")
+        label = tk.Label(tip, text="", font=(self.FONT, 11, 'bold'), bg=self.THEME['head'], fg='white')
+        label.pack(fill=tk.BOTH, expand=True)
+
+        def countdown(text, seconds=5):
+            for i in range(seconds, 0, -1):
+                label.config(text=f"{text}\n{i} 秒后记录鼠标位置")
+                self.root.update()
+                time.sleep(1)
+
+        countdown("把鼠标移到【分数输入框】")
+        self.score_input_box = tuple(pyautogui.position())
         self.log(f"✓ 分数输入框位置: {self.score_input_box}")
-        
-        # 设置提交按钮
-        self.log("\n5秒后，请将鼠标移到【绿色的提交分数按钮】")
-        for i in range(5, 0, -1):
-            self.log(f"{i}...")
-            self.root.update()
-            time.sleep(1)
-        
-        self.submit_button_pos = pyautogui.position()
+
+        countdown("把鼠标移到【提交分数按钮】")
+        self.submit_button_pos = tuple(pyautogui.position())
         self.log(f"✓ 提交按钮位置: {self.submit_button_pos}")
-        
+        tip.destroy()
+        self.root.deiconify()
+
         self.save_config()
         self.setup_status_label.config(text="● 已定位", fg=self.THEME['ok'])
         self.log("\n✓ 自动提交位置设置完成！")
@@ -1730,6 +2409,7 @@ class SimpleGradingUI:
         msg += f"测试分数: {test_score}\n"
         msg += f"输入框位置: {self.score_input_box}\n"
         msg += f"提交按钮位置: {self.submit_button_pos}\n\n"
+        msg += "注意：测试会真的输入并提交 10 分，请拿一份测试卷/空白卷试。\n"
         msg += "请确保阅卷窗口可见\n"
         msg += "3秒后开始测试"
         
@@ -1781,6 +2461,8 @@ class SimpleGradingUI:
         # 如果勾选了跳过确认，直接自动提交
         if self.skip_confirm_var.get() and not force:
             self.log(f"⚡ 跳过确认，直接提交分数: {score}")
+            self._save_record()
+            self._raise_window()
             if self.auto_click_var.get():
                 self.submit_score_async(score)
             else:
@@ -1799,8 +2481,9 @@ class SimpleGradingUI:
         # 创建自定义对话框
         dialog = tk.Toplevel(self.root)
         dialog.title("确认分数")
-        dialog.geometry("440x480")
+        dialog.geometry("520x560")
         dialog.transient(self.root)
+        dialog.attributes('-topmost', True)
         dialog.grab_set()
         
         # 居中显示
@@ -1813,15 +2496,21 @@ class SimpleGradingUI:
         content_frame = tk.Frame(dialog, padx=20, pady=20)
         content_frame.pack(fill=tk.BOTH, expand=True)
         
-        # 分数显示（大字体）
-        score_label = tk.Label(
-            content_frame,
-            text=f"建议分数: {score}/{max_score} 分",
-            font=('微软雅黑', 16, 'bold'),
-            fg='#ff6b00'
-        )
-        score_label.pack(pady=(0, 15))
-        
+        if force:
+            tk.Label(content_frame, text="⚠ 有需要人工复核的地方，请确认或直接改分",
+                     font=('微软雅黑', 9, 'bold'), fg='#c92a2a').pack(pady=(0, 8))
+
+        # 分数可编辑：AI 给错时直接在这里改，不用拒绝后手输
+        score_row = tk.Frame(content_frame)
+        score_row.pack(pady=(0, 12))
+        tk.Label(score_row, text="分数", font=('微软雅黑', 12)).pack(side=tk.LEFT, padx=(0, 8))
+        score_var = tk.StringVar(value=str(score))
+        score_entry = tk.Entry(score_row, textvariable=score_var, width=6, justify=tk.CENTER,
+                               font=('微软雅黑', 16, 'bold'), fg='#ff6b00',
+                               relief=tk.FLAT, highlightthickness=1, highlightcolor='#ff6b00')
+        score_entry.pack(side=tk.LEFT, ipady=3)
+        tk.Label(score_row, text=f"/ {max_score} 分", font=('微软雅黑', 11)).pack(side=tk.LEFT, padx=(6, 0))
+
         # 详情显示
         detail_frame = tk.Frame(content_frame, relief=tk.SUNKEN, bd=1)
         detail_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
@@ -1842,7 +2531,20 @@ class SimpleGradingUI:
         
         def on_accept():
             """接受分数"""
+            try:
+                final_score = float(score_var.get().strip())
+            except ValueError:
+                messagebox.showwarning("分数格式", "请输入数字，例如 12 或 10.5", parent=dialog)
+                return
+            final_score = fmt_score(max(0, min(final_score, float(max_score))))
+            if final_score != score:
+                self.log(f"✏ 人工改分: {score} → {final_score}")
+            self.pending_score = final_score
+            if self._record:
+                self._record[0]['score'] = final_score
+            self._save_record()
             dialog.destroy()
+            self._raise_window()
             self.log(f"\n✅ 用户确认分数: {self.pending_score}")
             
             # 如果开启自动点击
@@ -1859,18 +2561,22 @@ class SimpleGradingUI:
         
         def on_reject():
             """拒绝分数"""
+            self._save_record()
             dialog.destroy()
+            self._raise_window()
             self.log(f"\n❌ 用户拒绝分数: {self.pending_score}")
             self.log("请手动在平台输入正确分数")
             self.waiting_for_confirm = False
             self.pending_score = None
             self.is_grading = False
             self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT)
+
+        dialog.protocol("WM_DELETE_WINDOW", on_reject)
         
         # 接受按钮
         accept_btn = tk.Button(
             btn_frame,
-            text="✓ 接受 (Enter)",
+            text="✓ 提交 (Enter)",
             command=on_accept,
             bg=self.THEME['ok'], relief=tk.FLAT, bd=0,
             fg='white',
@@ -1883,7 +2589,7 @@ class SimpleGradingUI:
         # 拒绝按钮
         reject_btn = tk.Button(
             btn_frame,
-            text="✗ 拒绝 (Esc)",
+            text="✗ 跳过 (Esc)",
             command=on_reject,
             bg=self.THEME['danger'], relief=tk.FLAT, bd=0,
             fg='white',
@@ -1897,8 +2603,9 @@ class SimpleGradingUI:
         dialog.bind('<Return>', lambda e: on_accept())
         dialog.bind('<Escape>', lambda e: on_reject())
         
-        # 聚焦到接受按钮
-        accept_btn.focus_set()
+        # 聚焦分数输入框，方便直接改分；回车提交
+        score_entry.focus_set()
+        score_entry.select_range(0, tk.END)
     
     def submit_score_async(self, score):
         """在后台线程里自动输入分数并提交，界面不再卡住，暂停/停止按钮随时可点"""
@@ -1920,6 +2627,9 @@ class SimpleGradingUI:
             self.log(f"分数: {score}")
             self.log(f"输入框位置: {self.score_input_box}")
             self.log(f"提交按钮位置: {self.submit_button_pos}")
+
+            # 全程保持置顶，提交后主动抬回最前面
+            self.ui(self._raise_window)
             
             # 1. 三次点击分数输入框（确保选中）
             self.log(f"→ 点击分数输入框...")
@@ -1939,29 +2649,34 @@ class SimpleGradingUI:
             time.sleep(0.2)
             self.log(f"✓ 已清空")
             
-            # 3. 输入分数（使用多种方法）
+            # 3. 输入分数：优先剪贴板粘贴，避免中文输入法/小数点问题
             self.log(f"→ 输入分数 {score}...")
             score_str = str(score)
-            
-            # 方法1: 尝试typewrite
             try:
+                clip_ready = threading.Event()
+
+                def _set_clipboard():
+                    try:
+                        self.root.clipboard_clear()
+                        self.root.clipboard_append(score_str)
+                        self.root.update()
+                    finally:
+                        clip_ready.set()
+
+                self.ui(_set_clipboard)
+                if not clip_ready.wait(2):
+                    raise TimeoutError("设置剪贴板超时")
+                pyautogui.hotkey('ctrl', 'v')
+                self.log("✓ 使用粘贴输入")
+            except Exception:
+                self.log("→ 粘贴失败，改用键盘输入")
                 pyautogui.typewrite(score_str, interval=0.1)
-                self.log(f"✓ 使用typewrite输入")
-            except:
-                # 方法2: 逐个按键
-                self.log(f"→ typewrite失败，使用press方法...")
-                for char in score_str:
-                    pyautogui.press(char)
-                    time.sleep(0.1)
-                self.log(f"✓ 使用press输入")
             
             time.sleep(0.3)
             self.log(f"✓ 已输入分数: {score}")
             
-            # 4. 点击提交按钮（多次点击确保成功）
+            # 4. 点击提交按钮（只点一次，避免重复提交）
             self.log(f"→ 点击提交按钮...")
-            pyautogui.click(self.submit_button_pos[0], self.submit_button_pos[1])
-            time.sleep(0.2)
             pyautogui.click(self.submit_button_pos[0], self.submit_button_pos[1])
             time.sleep(0.5)
             self.log(f"✓ 已点击提交按钮")
@@ -1999,6 +2714,7 @@ class SimpleGradingUI:
             else:
                 self.log(f"✓ 自动提交完成\n")
                 self.is_grading = False
+                self.ui(self._raise_window)
                 self.ui(lambda: self.pause_btn.config(state=tk.DISABLED))
                 self.ui(lambda: self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT))
             
@@ -2017,6 +2733,7 @@ class SimpleGradingUI:
         self.is_grading = False
         self.auto_continue = False
         self.is_paused = False
+        self._raise_window()
         self.auto_var.set(False)
         self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停", bg=self.THEME['slate'])
         self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT)
@@ -2028,6 +2745,15 @@ class SimpleGradingUI:
         eff = int(3600 / avg) if avg > 0 else 0
         self.stats_label.config(text=f"已批 {self.grading_count} · 用时 {self.total_time:.0f}s · 均 {avg:.1f}s · {eff}/h")
     
+    def _raise_window(self):
+        """保持置顶，并在批改/提交后把窗口抬回最前面。"""
+        try:
+            if self.keep_topmost:
+                self.root.attributes('-topmost', True)
+            self.root.lift()
+        except Exception:
+            pass
+
     def ui(self, fn):
         """在主线程执行 fn（后台线程调用界面一律走这里）"""
         if threading.current_thread() is self._main_thread:
@@ -2156,6 +2882,8 @@ class SimpleGradingUI:
                 'rubric': self.saved_rubric,
                 'half_point': self.half_point,
                 'blank_threshold': self.blank_threshold,
+                'grade_samples': getattr(self, 'grade_samples', 0),
+                'keep_topmost': self.keep_topmost,
                 'auto_continue': self.auto_var.get() if hasattr(self, 'auto_var') else False,
                 'auto_click': self.auto_click_var.get() if hasattr(self, 'auto_click_var') else False,
                 'skip_confirm': self.skip_confirm_var.get() if hasattr(self, 'skip_confirm_var') else False,
@@ -2192,6 +2920,8 @@ class SimpleGradingUI:
                 self.saved_rubric = config.get('rubric', '')
                 self.half_point = bool(config.get('half_point', False))
                 self.blank_threshold = float(config.get('blank_threshold', 0.0015))
+                self.grade_samples = int(config.get('grade_samples', 0) or 0)
+                self.keep_topmost = bool(config.get('keep_topmost', True))
                 
                 # 加载复选框状态
                 self.saved_auto_continue = config.get('auto_continue', False)
@@ -2294,6 +3024,7 @@ class SimpleGradingUI:
             score = result.get('score', 0)
             analysis = result.get('analysis', '')
             deductions = result.get('deduction_details', [])
+            items = result.get('items') or []
             
             content = f"\n\n## 📝 题号 {question_num} ({datetime.now().strftime('%H:%M')})\n"
             content += f"- **模型**: {model_name}\n"
@@ -2301,10 +3032,19 @@ class SimpleGradingUI:
             content += f"- **得分**: {score}/{max_score}\n"
             content += f"- **评语**: {analysis}\n"
             
-            if deductions:
+            if items:
+                content += "- **给分点**:\n"
+                for it in items:
+                    reason = str(it.get('reason', '') or '')
+                    content += f"    - {it.get('point', '')}: {fmt_score(it.get('got', 0))}/{fmt_score(it.get('full', 0))} {reason}\n"
+            elif deductions:
                 content += "- **扣分详情**:\n"
                 for d in deductions:
                     content += f"    - {d['point']}: -{d['deduction']}\n"
+
+            reasons = result.get('_reasons') or []
+            if reasons:
+                content += "- **需人工复核**: " + "；".join(str(r) for r in reasons) + "\n"
             
             content += f"\n![[{img_filename}]]\n"
             content += "---\n"
@@ -2343,10 +3083,13 @@ class SimpleGradingUI:
             today = datetime.now().strftime("%Y-%m-%d")
             html_file = os.path.join(html_dir, f"{today}.html")
             
-            question_num = self.question_num_entry.get().strip()
+            from html import escape
+            question_num = escape(self.question_num_entry.get().strip())
             score = result.get('score', 0)
-            analysis = result.get('analysis', '')
+            analysis = escape(str(result.get('analysis', '')))
             deductions = result.get('deduction_details', []) # 修正变量名
+            items = result.get('items') or []
+            reasons = result.get('_reasons') or []
             time_str = datetime.now().strftime('%H:%M:%S')
             
             # 构造单个卡片 HTML
@@ -2354,7 +3097,7 @@ class SimpleGradingUI:
             <div class="card">
                 <div class="header">
                     <span class="title">题号: {question_num}</span>
-                    <span class="model-tag">{model_name}</span>
+                    <span class="model-tag">{escape(str(model_name))}</span>
                     <span class="time">⏱ {elapsed:.1f}s</span>
                     <span class="time" style="font-size: 0.8em; opacity: 0.7;">(Avg: {avg_time:.1f}s)</span>
                     <span class="time">{time_str}</span>
@@ -2367,11 +3110,21 @@ class SimpleGradingUI:
                         <p><strong>评语:</strong> {analysis}</p>
             """
             
-            if deductions:
+            if items:
+                card_html += "<ul class='items'>"
+                for it in items:
+                    reason = escape(str(it.get('reason', '') or ''))
+                    card_html += (f"<li>{escape(str(it.get('point', '')))}："
+                                  f"<b>{fmt_score(it.get('got', 0))}/{fmt_score(it.get('full', 0))}</b>"
+                                  f"{('　' + reason) if reason else ''}</li>")
+                card_html += "</ul>"
+            elif deductions:
                 card_html += "<ul>"
                 for d in deductions:
                     card_html += f"<li>{d['point']}: <span class='deduction'>-{d['deduction']}</span></li>"
                 card_html += "</ul>"
+            if reasons:
+                card_html += "<div class='review'>⚠ 需人工复核：" + escape("；".join(str(r) for r in reasons)) + "</div>"
             
             card_html += f"""
                     </div>
@@ -2401,6 +3154,8 @@ class SimpleGradingUI:
         .score {{ color: #d32f2f; font-size: 1.5em; }}
         .analysis-box {{ color: #555; line-height: 1.6; margin-bottom: 20px; }}
         .deduction {{ color: #f44336; font-weight: bold; }}
+        .items li {{ margin: 4px 0; }}
+        .review {{ background: #fff5f5; color: #c92a2a; border: 1px solid #ffc9c9; padding: 8px 12px; border-radius: 6px; margin-top: 10px; }}
         .img-box img {{ max-width: 100%; border-radius: 8px; border: 1px solid #eee; cursor: pointer; transition: transform 0.2s; }}
         .img-box img:hover {{ transform: scale(1.01); }}
         ul {{ background: #fff3e0; padding: 10px 10px 10px 30px; border-radius: 6px; }}
