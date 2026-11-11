@@ -1,8 +1,8 @@
 {
-  "version": "1.5.1",
-  "notes": "模型设置：预设 11 家提供商的地址（Gemini、硅基流动、阿里云百炼、智谱、火山方舟、Kimi、DeepSeek、OpenAI、OpenRouter、Magpie、自定义），选好只需填 Key；每家附说明和「去申请 Key」链接；各家 Key 分别保存；修复首次使用时打开模型设置报错",
+  "version": "1.6.0",
+  "notes": "批改逻辑恢复为原版：原版提示词、原版请求方式（Gemini 官方库直接调用；其他家 PNG 原图 + max_tokens 4096，不加任何额外参数）、原版结果显示（得分、扣分详情、评语）。去掉逐点加总、空白卷检测、强制确认。保留：新界面、在线更新、预设各家地址、后台批改不卡界面；填了给分点会附在参考答案后面一起发给模型",
   "files": {
-    "zhixue_simple.py": "2bfbea74e1b9f5ff3df3a9ed87b4b0b0cd1247158f0c9a4d72d3fce77333744e",
+    "zhixue_simple.py": "dd2c772c02b859927eca432827199fc2bfbe25ce1b0a24adbe9b63c35dc17ce1",
     "start.pyw": "df2bda5027b52182584f74fc587977a484742792d53d8f21bd5a174012995249",
     "make_shortcut.bat": "925555f845c456b3211ad06c624bf67a64f2f4fc58c5a35817995f169477f3c9",
     "README.md": "329d6ac06cc2fe773f6617efa6cc6eaa0bfe2543f42e137707c9daf97127cf83",

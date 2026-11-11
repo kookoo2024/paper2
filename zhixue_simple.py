@@ -106,7 +106,7 @@ GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 HTTP_TIMEOUT = 120  # 秒：连续这么久收不到任何数据才算超时（流式接收，长回答不会被误判）
 
 # ================= 在线更新 =================
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -1220,40 +1220,45 @@ class SimpleGradingUI:
             self.last_img_hash = img_hash
             self.current_student_img = student_img # 保存引用以供导出
             
-            # 空白卷：墨迹太少直接判 0，不调用模型（省时间，也防止模型对着空白“脑补”）
-            ix, iy = x - x0 + 4, y - y0 + 4   # 只看原框选区域内部，避开边框线
-            ink = ink_ratio(student_img.crop((ix, iy, max(ix + 1, ix + w - 8), max(iy + 1, iy + h - 8))))
-            if ink < self.blank_threshold:
-                self.log(f"  空白卷（墨迹占比 {ink:.2%}），直接判 0 分")
-                result = {"transcription": "（空白）", "items": [], "score": 0, "confidence": "高",
-                          "unclear": False, "alt_method": False, "analysis": "空白卷，未作答", "blank": True}
-                elapsed = time.time() - start_time
-                self.grading_count += 1
-                self.total_time += elapsed
-                self.root.after(0, lambda: self.display_result(result, max_score, elapsed, "空白检测"))
-                return
-
+            # —— 以下批改逻辑与原版（初始版本）一致：图片 + 提示词一次发给模型，直接返回结果 ——
             rubric = self.rubric_text.get('1.0', tk.END).strip()
-            prompt = build_grading_prompt(question_num, max_score, standard_answer, rubric, self.half_var.get())
+            answer_part = standard_answer + (f"\n给分点：\n{rubric}" if rubric else "")
+            prompt = f"""你是严谨的判卷老师，请严格按照【参考答案】中的评分标准（步骤分）批改这道题。
 
-            try:
-                # 使用统一接口，强制 JSON
-                result = self.call_ai_api(prompt, student_img, need_json=True)
-            except Exception as e:
-                # 备用：如果是Gemini，尝试备用（其实统一接口已经处理了，这里可能不需要了，但由于有fallback逻辑，保留一点容错?）
-                # 由于 call_ai_api 已经封装，这里主要捕获最终错误
-                raise e
-            
+题号：{question_num}
+满分：{max_score}分
+参考答案：
+{answer_part}
+
+图片是学生的答案。
+
+请仔细对比学生答案与参考答案，严格判定每一步是否正确。如果是步骤给分题，必须检查学生是否写出了关键步骤。
+如果学生答案与参考答案不仅仅是格式不同，而是逻辑或数值错误，必须扣分。
+
+按以下JSON格式返回：
+{{
+    "student_answer": "学生写的答案内容（简述）",
+    "score": 得分数字,
+    "deduction_details": [
+        {{"point": "具体扣分原因（如：未化简、计算错误、步骤缺失）", "deduction": 扣分值}}
+    ],
+    "analysis": "详细评语（指出哪里错了，为什么扣分）"
+}}
+
+严厉评分规则：
+1. 总分不能超过满分，不能低于0分。
+2. 必须严格执行参考答案中的给分点，步骤缺失扣步骤分。
+3. 严格计算最终得分 = 满分 - 扣分总和。
+
+只返回JSON，不要其他内容。"""
+
+            result = self.call_ai_api(prompt, student_img, need_json=True)
+
             elapsed = time.time() - start_time
             self.grading_count += 1
             self.total_time += elapsed
-            
+
             model_name = self.config.get('model_name', 'Unknown')
-            st = dict(STATS)
-            if st.get('t0'):
-                self.log(f"  ⏱ {elapsed:.1f} 秒（其中模型 {time.time() - st['t0']:.1f} 秒，回答 {st.get('chars', 0)} 字）· {model_name}")
-            if elapsed > 20:
-                self.log("  ⚠ 这一份超过 20 秒，主要是模型本身慢（可能开着“思考”），可在「模型」里换一个快的识图模型。")
             self.root.after(0, lambda: self.display_result(result, max_score, elapsed, model_name))
             
         except Exception as e:
@@ -1269,49 +1274,29 @@ class SimpleGradingUI:
                 self.root.after(0, lambda: self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT))
     
     def display_result(self, result, max_score, elapsed, model_name="Unknown"):
-        """显示结果：总分由程序按给分点加总，不信任模型自己算的总分"""
-        score, items, reasons = settle_score(result, max_score, self.half_var.get())
-        need_review = bool(reasons)
-        analysis = result.get('analysis', '')
-        transcription = (result.get('transcription') or '').strip()
-        conf = result.get('confidence', '')
-
-        # 兼容旧的导出格式（Obsidian / HTML 读 score 和 deduction_details）
+        """显示结果（原版逻辑）"""
+        try:
+            score = float(result.get('score', 0))
+        except (TypeError, ValueError):
+            score = 0
+        score = fmt_score(max(0, min(score, float(max_score))))   # 不超过满分、不低于 0
         result['score'] = score
-        result['deduction_details'] = [
-            {"point": f"{it['point']}" + (f"：{it['reason']}" if it.get('reason') else ''),
-             "deduction": fmt_score(it['full'] - it['got'])}
-            for it in items if it['got'] < it['full']]
-        if transcription:
-            result['student_answer'] = transcription
+        analysis = result.get('analysis', '')
+        deductions = result.get('deduction_details', []) or []
 
-        self.current_score_label.config(text=f"建议分数  {fmt_score(score)} / {max_score}")
+        self.current_score_label.config(text=f"建议分数  {score} / {max_score}")
 
-        detail_text = ""
-        if reasons:
-            detail_text += "⚠ " + "；".join(reasons) + "，请人工核对\n\n"
-        if transcription:
-            t = transcription if len(transcription) <= 160 else transcription[:160] + "…"
-            detail_text += f"识别：{t}\n\n"
-        if items:
-            for it in items:
-                mark = "✓" if it['got'] >= it['full'] else ("✗" if it['got'] == 0 else "△")
-                line = f"{mark} {it['point']}  {fmt_score(it['got'])}/{fmt_score(it['full'])}"
-                if it.get('reason') and it['got'] < it['full']:
-                    line += f"（{it['reason']}）"
-                detail_text += line + "\n"
-        if analysis:
-            detail_text += f"\n评语：{analysis}"
-        if conf:
-            detail_text += f"\n把握度：{conf}"
+        detail_text = f"评语: {analysis}\n"
+        if deductions:
+            detail_text += "\n扣分详情:\n"
+            for d in deductions:
+                if isinstance(d, dict):
+                    detail_text += f"  • {d.get('point', '未命名扣分点')}: -{d.get('deduction', 0)}分\n"
 
-        self.current_analysis_label.config(text=detail_text.strip())
+        self.current_analysis_label.config(text=detail_text)
 
-        self.log(f"  得分: {fmt_score(score)}/{max_score}  把握度: {conf or '-'}  用时: {elapsed:.1f}s ({model_name})")
-        if transcription:
-            self.log(f"  识别: {transcription[:80]}")
-        for r_ in reasons:
-            self.log(f"  ⚠ {r_}，本份强制人工确认")
+        self.log(f"  得分: {score}/{max_score} 用时: {elapsed:.1f}s ({model_name})")
+        self.log(f"\n💡 建议分数: {score} 分")
 
         self.update_stats()
         avg_time = self.total_time / self.grading_count if self.grading_count > 0 else 0
@@ -1321,7 +1306,7 @@ class SimpleGradingUI:
 
         self.waiting_for_confirm = True
         self.pending_score = score
-        self.show_confirm_dialog(score, max_score, detail_text, force=need_review)
+        self.show_confirm_dialog(score, max_score, detail_text)
 
     def init_model(self):
         """初始化模型"""
@@ -1348,16 +1333,12 @@ class SimpleGradingUI:
              if provider == 'Gemini' and not api_key:
                  api_key = DEFAULT_CONFIG['api_key']
         
-        STATS.clear()
         if provider == 'Gemini':
-            # 和原版一样：用官方库，把图片和提示词一次发过去
+            # Gemini 必须先初始化 self.model
             if not hasattr(self, 'model'):
                 self.init_model()
-            t0 = time.time()
-            response = self.model.generate_content([prompt, image], generation_config={"temperature": 0},
-                                                   request_options={"timeout": HTTP_TIMEOUT})
+            response = self.model.generate_content([prompt, image])
             text = response.text
-            STATS.update(t0=t0, chars=len(text))
             return self.parse_json_result(text) if need_json else text
 
         if True:
@@ -1399,47 +1380,30 @@ class SimpleGradingUI:
             import urllib.error
             import json
             
+            # 转换图片为Base64（原版：PNG 原图）
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+
             url = f"{base_url.rstrip('/')}/chat/completions"
             messages = [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_to_data_url(image)}},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_str}"}},
             ]}]
-            data = {"model": model_name, "messages": messages, "max_tokens": 4096,
-                    "temperature": 0}  # 阅卷要稳定，同一份卷子多次评分应一致
-            bad = getattr(self, '_bad_params', set())
-            for k, v in no_think_params(model_name, base_url).items():
-                if (model_name, k) not in bad:
-                    data[k] = v
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
-                       "User-Agent": "ZhixueGrader/1.0"}
+            data = {"model": model_name, "messages": messages, "max_tokens": 4096}
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
-            last, retried = None, False
-            for _ in range(3):
-                try:
-                    t0 = time.time()
-                    content = post_chat_plain(url, data, headers)
-                    STATS.update(t0=t0, chars=len(content))
+            try:
+                req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
+                with http_open(req) as response:
+                    result_json = json.loads(response.read().decode('utf-8'))
+                    content = result_json['choices'][0]['message']['content']
                     return self.parse_json_result(content) if need_json else content
-                except urllib.error.HTTPError as e:
-                    msg = e.read().decode('utf-8', 'ignore')[:300]
-                    extra = [k for k in ("enable_thinking", "reasoning_effort", "thinking") if k in data]
-                    if e.code == 400 and 'temperature' in msg and 'temperature' in data:
-                        extra.append('temperature')   # 部分模型（如 gpt-5）只接受默认温度
-                    if e.code == 400 and extra:
-                        for k in extra:   # 这个模型不认关思考的参数：去掉再试，并记住下次不再带
-                            data.pop(k)
-                            self._bad_params = getattr(self, '_bad_params', set()) | {(model_name, k)}
-                        continue
-                    last = Exception(f"API Error {e.code}: {msg}")
-                except Exception as e:
-                    last = e if str(e).startswith(("API", "模型")) else Exception(f"API Call Failed: {e}")
-                if not retried and is_retryable(last):   # 超时 / 服务繁忙时自动重试一次
-                    retried = True
-                    self.log(f"  ⚠ {last}，5 秒后重试一次…")
-                    time.sleep(5)
-                    continue
-                break
-            raise last
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode('utf-8', 'ignore')
+                raise Exception(f"API Error {e.code}: {error_body}")
+            except Exception as e:
+                raise Exception(f"API Call Failed: {str(e)}")
 
     def _call_siliconflow_vision(self, api_key, model, prompt, image):
         """内部辅助：调用 SiliconFlow 的 Vision 模型进行 OCR"""
