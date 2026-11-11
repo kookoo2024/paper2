@@ -26,3 +26,6 @@ venv/
 
 # 日志
 *.log
+run.log
+backup/
+__pycache__/

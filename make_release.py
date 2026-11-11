@@ -2,7 +2,7 @@
 用法：python make_release.py "这次更新说明" """
 import hashlib, json, re, sys
 
-FILES = ["zhixue_simple.py", "README.md", "requirements.txt"]
+FILES = ["zhixue_simple.py", "start.pyw", "make_shortcut.bat", "README.md", "requirements.txt"]
 src = open("zhixue_simple.py", encoding="utf-8").read()
 version = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', src, re.M).group(1)
 notes = sys.argv[1] if len(sys.argv) > 1 else ""

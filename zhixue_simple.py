@@ -59,7 +59,7 @@ PROVIDERS = {
 HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
 
 # ================= 在线更新 =================
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -97,7 +97,7 @@ def check_update(custom_base=""):
 
 def apply_update(info, base):
     """下载 version.json 列出的文件，校验后替换；旧文件备份到 backup/ 目录。返回更新的文件列表"""
-    import os, hashlib, shutil, urllib.request
+    import os, hashlib, shutil, urllib.request, urllib.parse
     app_dir = os.path.dirname(os.path.abspath(__file__))
     files = info.get("files") or {"zhixue_simple.py": ""}
     if isinstance(files, list):
@@ -106,13 +106,13 @@ def apply_update(info, base):
     for name, sha in files.items():
         if ".." in name or os.path.isabs(name) or name.endswith("config.json"):
             continue  # 安全：不允许写到程序目录之外，也绝不覆盖用户配置
-        req = urllib.request.Request(base.rstrip("/") + "/" + name + "?t=" + str(int(time.time())),
+        req = urllib.request.Request(base.rstrip("/") + "/" + urllib.parse.quote(name) + "?t=" + str(int(time.time())),
                                      headers={"User-Agent": f"ZhixueGrader/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=60) as r:
             data = r.read()
         if sha and hashlib.sha256(data).hexdigest().lower() != sha.lower():
             raise Exception(f"{name} 校验失败（可能镜像还没同步），已取消更新，原文件未改动")
-        if name.endswith(".py"):
+        if name.endswith((".py", ".pyw")):
             compile(data.decode("utf-8"), name, "exec")  # 语法检查，坏文件不替换
         staged[name] = data
     if not staged:
@@ -281,9 +281,9 @@ class SimpleGradingUI:
         import queue
         self._uiq = queue.Queue()
         self._main_thread = threading.current_thread()
-        self.root.title(f"知学网阅卷助手 v{APP_VERSION}")
+        self.root.title(f"阅卷 V{APP_VERSION}")
         
-        self.root.geometry("270x700")
+        self.root.geometry("290x720")
         self.root.resizable(False, False)  # 固定大小
         self.root.attributes('-topmost', True)  # 窗口置顶
 
@@ -336,325 +336,186 @@ class SimpleGradingUI:
         self.save_config()
         self.root.destroy()
     
-    def create_widgets(self):
-        """创建界面"""
-        # 标题（更紧凑）
-        title_frame = tk.Frame(self.root, bg='#2196F3', height=40)
-        title_frame.pack(fill=tk.X)
-        title_frame.pack_propagate(False)
-        
-        tk.Label(
-            title_frame, 
-            text=f"阅卷助手 v{APP_VERSION}", 
-            font=('微软雅黑', 10, 'bold'),
-            bg='#2196F3',
-            fg='white'
-        ).pack(side=tk.LEFT, padx=10, pady=10)
-        
-        # 模型设置按钮
-        tk.Button(
-            title_frame,
-            text="🤖 模型",
-            command=self.setup_model,
-            bg='#1976D2',
-            fg='white',
-            font=('微软雅黑', 8),
-            bd=0,
-            cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=10, ipadx=5, ipady=2)
-        
-        # 在线更新按钮
-        self.update_btn = tk.Button(
-            title_frame,
-            text="⬆",
-            command=lambda: self.check_update_ui(silent=False),
-            bg='#1565C0',
-            fg='white',
-            font=('微软雅黑', 8),
-            bd=0,
-            cursor='hand2'
-        )
-        self.update_btn.pack(side=tk.RIGHT, padx=(0, 4), ipadx=3, ipady=2)
+    # ---------- 界面样式 ----------
+    THEME = {
+        'bg': '#F3F5F9',        # 窗口底色
+        'card': '#FFFFFF',      # 卡片
+        'line': '#E2E8F0',      # 描边
+        'text': '#1E293B',      # 正文
+        'sub': '#64748B',       # 次要文字
+        'head': '#0F172A',      # 顶栏
+        'head2': '#1E293B',     # 顶栏按钮
+        'primary': '#2563EB',   # 主色
+        'primary_d': '#1D4ED8',
+        'ok': '#059669',
+        'ok_bg': '#ECFDF5',
+        'warn': '#D97706',
+        'danger': '#DC2626',
+        'slate': '#475569',
+        'tint': '#EFF4FF',      # 浅蓝底
+    }
+    FONT = '微软雅黑'
+    GRADE_TEXT = "▶ 批改  (空格)"
 
-        # Obsidian 设置按钮
-        tk.Button(
-            title_frame,
-            text="📓 笔记",
-            command=self.setup_obsidian_path,
-            bg='#7C4DFF',
-            fg='white',
-            font=('微软雅黑', 8),
-            bd=0,
-            cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=0, ipadx=5, ipady=2)
-        
-        main_frame = tk.Frame(self.root, padx=10, pady=5)
+    def _btn(self, parent, text, cmd, bg, fg='white', size=8, bold=False, active=None, **kw):
+        return tk.Button(
+            parent, text=text, command=cmd, bg=bg, fg=fg,
+            activebackground=active or bg, activeforeground=fg,
+            font=(self.FONT, size, 'bold' if bold else 'normal'),
+            relief=tk.FLAT, bd=0, cursor='hand2', padx=kw.pop('padx', 6), pady=kw.pop('pady', 1), **kw)
+
+    def _entry(self, parent, width):
+        T = self.THEME
+        return tk.Entry(parent, width=width, font=(self.FONT, 9), relief=tk.FLAT, bg='#F8FAFC', fg=T['text'],
+                        highlightthickness=1, highlightbackground=T['line'], highlightcolor=T['primary'],
+                        insertbackground=T['text'])
+
+    def _card(self, parent, title, hint=None, expand=False):
+        """卡片式分组：白底细边框 + 小标题，返回内容区"""
+        T = self.THEME
+        outer = tk.Frame(parent, bg=T['card'], highlightthickness=1, highlightbackground=T['line'])
+        outer.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(0, 6))
+        head = tk.Frame(outer, bg=T['card'])
+        head.pack(fill=tk.X, padx=8, pady=(5, 2))
+        tk.Frame(head, bg=T['primary'], width=3, height=12).pack(side=tk.LEFT, padx=(0, 5))
+        tk.Label(head, text=title, font=(self.FONT, 8, 'bold'), bg=T['card'], fg=T['text']).pack(side=tk.LEFT)
+        if hint:
+            tk.Label(head, text=hint, font=(self.FONT, 7), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT, padx=(5, 0))
+        body = tk.Frame(outer, bg=T['card'])
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 7))
+        return head, body
+
+    def create_widgets(self):
+        """创建界面（紧凑卡片式）"""
+        T, F = self.THEME, self.FONT
+        self.root.configure(bg=T['bg'])
+
+        # ===== 顶栏：标题 + 版本 + 工具按钮 =====
+        bar = tk.Frame(self.root, bg=T['head'], height=40)
+        bar.pack(fill=tk.X)
+        bar.pack_propagate(False)
+        tk.Label(bar, text="阅卷", font=(F, 13, 'bold'), bg=T['head'], fg='white').pack(side=tk.LEFT, padx=(12, 4))
+        tk.Label(bar, text=f"V{APP_VERSION}", font=('Consolas', 7, 'bold'), bg=T['head2'], fg='#93C5FD',
+                 padx=4, pady=1).pack(side=tk.LEFT, pady=(4, 0))
+
+        tools = tk.Frame(bar, bg=T['head'])
+        tools.pack(side=tk.RIGHT, padx=8)
+        self.update_btn = self._btn(tools, "更新", lambda: self.check_update_ui(silent=False), T['head2'],
+                                    active=T['primary'], padx=7, pady=3)
+        self.update_btn.pack(side=tk.RIGHT)
+        self._btn(tools, "笔记", self.setup_obsidian_path, T['head2'], active=T['primary'],
+                  padx=7, pady=3).pack(side=tk.RIGHT, padx=(0, 3))
+        self._btn(tools, "模型", self.setup_model, T['head2'], active=T['primary'],
+                  padx=7, pady=3).pack(side=tk.RIGHT, padx=(0, 3))
+
+        # ===== 底部状态栏 =====
+        status = tk.Frame(self.root, bg=T['head'])
+        status.pack(fill=tk.X, side=tk.BOTTOM)
+        self.stats_label = tk.Label(status, text="已批 0 · 用时 0s · 均 0s · 0/h", font=(F, 7),
+                                    fg='#CBD5E1', bg=T['head'])
+        self.stats_label.pack(pady=2)
+
+        main_frame = tk.Frame(self.root, bg=T['bg'], padx=8, pady=8)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 1. 答案区域（更紧凑）
-        region_frame = tk.LabelFrame(main_frame, text="① 答案区域", font=('微软雅黑', 8, 'bold'), padx=6, pady=4)
-        region_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        region_info_frame = tk.Frame(region_frame)
-        region_info_frame.pack(fill=tk.X)
-        
-        self.region_preview = tk.Label(region_info_frame, text="未设置", bg='#f0f0f0', font=('微软雅黑', 8), anchor='w', padx=5)
+
+        # ===== ① 答题区域 =====
+        _, body = self._card(main_frame, "① 答题区域")
+        self.region_preview = tk.Label(body, text="未框选", bg=T['tint'], fg=T['sub'], font=(F, 8),
+                                       anchor='w', padx=6, pady=2)
         self.region_preview.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        tk.Button(
-            region_info_frame, 
-            text="📷 设置", 
-            command=self.setup_region,
-            bg='#4CAF50',
-            fg='white',
-            font=('微软雅黑', 8),
-            cursor='hand2',
-            width=8
-        ).pack(side=tk.RIGHT, padx=(5, 0))
-        
-        # 2. 题目设置（更紧凑）
-        question_frame = tk.LabelFrame(main_frame, text="② 题目", font=('微软雅黑', 8, 'bold'), padx=6, pady=4)
-        question_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        
-        # 题号和满分（横向布局）
-        info_frame = tk.Frame(question_frame)
-        info_frame.pack(fill=tk.X, pady=(0, 4))
-        
-        tk.Label(info_frame, text="题号:", font=('微软雅黑', 8)).pack(side=tk.LEFT)
-        self.question_num_entry = tk.Entry(info_frame, width=8, font=('微软雅黑', 9))
-        self.question_num_entry.pack(side=tk.LEFT, padx=(3, 10))
-        
-        tk.Label(info_frame, text="满分:", font=('微软雅黑', 8)).pack(side=tk.LEFT)
-        self.max_score_entry = tk.Entry(info_frame, width=6, font=('微软雅黑', 9))
-        self.max_score_entry.pack(side=tk.LEFT, padx=3)
-        
-        # 参考答案
-        answer_label_frame = tk.Frame(question_frame)
-        answer_label_frame.pack(fill=tk.X, pady=(0, 2))
-        
-        tk.Label(answer_label_frame, text="参考答案:", font=('微软雅黑', 8)).pack(side=tk.LEFT)
-        
-        tk.Button(
-            answer_label_frame,
-            text="📷",
-            command=self.capture_standard_answer,
-            bg='#2196F3',
-            fg='white',
-            font=('微软雅黑', 7),
-            cursor='hand2',
-            width=3
-        ).pack(side=tk.RIGHT, padx=(2, 0))
-        
-        tk.Button(
-            answer_label_frame,
-            text="清空",
-            command=lambda: self.answer_text.delete('1.0', tk.END),
-            bg='#757575',
-            fg='white',
-            font=('微软雅黑', 7),
-            cursor='hand2',
-            width=4
-        ).pack(side=tk.RIGHT)
-        
-        self.answer_text = scrolledtext.ScrolledText(
-            question_frame,
-            height=2,
-            font=('微软雅黑', 8),
-            wrap=tk.WORD
-        )
+        self._btn(body, "框选", self.setup_region, T['primary'], active=T['primary_d'],
+                  padx=10, pady=2).pack(side=tk.RIGHT, padx=(6, 0))
+
+        # ===== ② 题目 =====
+        _, body = self._card(main_frame, "② 题目", hint="自动保存", expand=True)
+        row = tk.Frame(body, bg=T['card'])
+        row.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(row, text="题号", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
+        self.question_num_entry = self._entry(row, 6)
+        self.question_num_entry.pack(side=tk.LEFT, padx=(3, 8), ipady=1)
+        tk.Label(row, text="满分", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
+        self.max_score_entry = self._entry(row, 4)
+        self.max_score_entry.pack(side=tk.LEFT, padx=3, ipady=1)
+
+        row2 = tk.Frame(body, bg=T['card'])
+        row2.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(row2, text="参考答案", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
+        self._btn(row2, "清空", lambda: (self.answer_text.delete('1.0', tk.END), self.save_question_data()),
+                  '#F1F5F9', fg=T['slate'], size=7, active=T['line']).pack(side=tk.RIGHT)
+        self._btn(row2, "截图识别", self.capture_standard_answer, T['tint'], fg=T['primary'], size=7,
+                  active='#DBEAFE').pack(side=tk.RIGHT, padx=(0, 4))
+
+        self.answer_text = scrolledtext.ScrolledText(body, height=3, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
+                                                     bg='#F8FAFC', fg=T['text'], highlightthickness=1,
+                                                     highlightbackground=T['line'], highlightcolor=T['primary'])
         self.answer_text.pack(fill=tk.BOTH, expand=True)
-        
-        # 绑定自动保存事件
-        self.question_num_entry.bind('<FocusOut>', lambda e: self.save_question_data())
-        self.question_num_entry.bind('<KeyRelease>', lambda e: self.save_question_data())
-        
-        self.max_score_entry.bind('<FocusOut>', lambda e: self.save_question_data())
-        self.max_score_entry.bind('<KeyRelease>', lambda e: self.save_question_data())
-        
-        self.answer_text.bind('<FocusOut>', lambda e: self.save_question_data())
-        self.answer_text.bind('<KeyRelease>', lambda e: self.save_question_data())
-        
-        # 自动保存提示
-        tk.Label(question_frame, text="💡 修改后自动保存", font=('微软雅黑', 7), fg='#666').pack(pady=(2, 0))
-        
-        # 3. 批改控制（更紧凑）
-        control_frame = tk.LabelFrame(main_frame, text="③ 控制", font=('微软雅黑', 8, 'bold'), padx=6, pady=4)
-        control_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        # 批改按钮区域（横向布局）
-        btn_frame = tk.Frame(control_frame)
-        btn_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        # 批改按钮
-        self.grade_btn = tk.Button(
-            btn_frame,
-            text="🚀 批改 (空格)",
-            command=self.grade_answer,
-            bg='#FF9800',
-            fg='white',
-            font=('微软雅黑', 9, 'bold'),
-            height=1,
-            cursor='hand2'
-        )
-        self.grade_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
-        
-        # 暂停/继续按钮
-        self.pause_btn = tk.Button(
-            btn_frame,
-            text="⏸ 暂停",
-            command=self.toggle_pause,
-            bg='#2196F3',
-            fg='white',
-            font=('微软雅黑', 9, 'bold'),
-            height=1,
-            cursor='hand2',
-            state=tk.DISABLED
-        )
-        self.pause_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        # 选项区域（更紧凑，横向布局）
-        options_frame = tk.Frame(control_frame)
-        options_frame.pack(fill=tk.X)
-        
-        # 第一行：三个复选框
-        check_frame = tk.Frame(options_frame)
-        check_frame.pack(fill=tk.X, pady=(0, 3))
-        
+
+        for w in (self.question_num_entry, self.max_score_entry, self.answer_text):
+            w.bind('<FocusOut>', lambda e: self.save_question_data())
+            w.bind('<KeyRelease>', lambda e: self.save_question_data())
+
+        # ===== ③ 批改控制 =====
+        _, body = self._card(main_frame, "③ 批改")
+        btns = tk.Frame(body, bg=T['card'])
+        btns.pack(fill=tk.X, pady=(0, 5))
+        self.grade_btn = self._btn(btns, self.GRADE_TEXT, self.grade_answer, T['primary'], size=10, bold=True,
+                                   active=T['primary_d'], pady=4)
+        self.grade_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.pause_btn = self._btn(btns, "⏸ 暂停", self.toggle_pause, T['slate'], size=9, bold=True,
+                                   pady=4, state=tk.DISABLED, disabledforeground='#CBD5E1')
+        self.pause_btn.pack(side=tk.LEFT, ipadx=4)
+
+        checks = tk.Frame(body, bg=T['card'])
+        checks.pack(fill=tk.X, pady=(0, 3))
+        ck = dict(font=(F, 8), bg=T['card'], fg=T['text'], activebackground=T['card'],
+                  selectcolor='white', bd=0, highlightthickness=0)
         self.auto_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            check_frame,
-            text="自动连续",
-            variable=self.auto_var,
-            font=('微软雅黑', 8),
-            command=self.on_checkbox_changed
-        ).pack(side=tk.LEFT)
-        
+        tk.Checkbutton(checks, text="连续", variable=self.auto_var, command=self.on_checkbox_changed, **ck).pack(side=tk.LEFT)
         self.auto_click_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            check_frame,
-            text="自动点击",
-            variable=self.auto_click_var,
-            font=('微软雅黑', 8),
-            command=self.save_config
-        ).pack(side=tk.LEFT, padx=(10, 0))
-        
+        tk.Checkbutton(checks, text="自动填分", variable=self.auto_click_var, command=self.save_config, **ck).pack(side=tk.LEFT, padx=(6, 0))
         self.skip_confirm_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            check_frame,
-            text="跳过确认⚡",
-            variable=self.skip_confirm_var,
-            font=('微软雅黑', 8),
-            command=self.save_config
-        ).pack(side=tk.LEFT, padx=(10, 0))
-        
-        # 第二行：间隔和按钮（一行显示）
-        bottom_frame = tk.Frame(options_frame)
-        bottom_frame.pack(fill=tk.X)
-        
-        # 间隔设置
-        tk.Label(bottom_frame, text="间隔:", font=('微软雅黑', 7)).pack(side=tk.LEFT)
-        self.delay_entry = tk.Entry(bottom_frame, width=3, font=('微软雅黑', 8))
+        ck_skip = dict(ck, fg=T['warn'])
+        tk.Checkbutton(checks, text="跳过确认", variable=self.skip_confirm_var, command=self.save_config, **ck_skip).pack(side=tk.LEFT, padx=(6, 0))
+
+        opts = tk.Frame(body, bg=T['card'])
+        opts.pack(fill=tk.X)
+        tk.Label(opts, text="间隔", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
+        self.delay_entry = self._entry(opts, 3)
         self.delay_entry.insert(0, "3")
         self.delay_entry.pack(side=tk.LEFT, padx=2)
         self.delay_entry.bind('<FocusOut>', lambda e: self.save_config())
-        tk.Label(bottom_frame, text="秒", font=('微软雅黑', 7)).pack(side=tk.LEFT)
-        
-        # 设置按钮
-        tk.Button(
-            bottom_frame,
-            text="⚙设置",
-            command=self.setup_score_buttons,
-            bg='#607D8B',
-            fg='white',
-            font=('微软雅黑', 7),
-            cursor='hand2'
-        ).pack(side=tk.LEFT, padx=(10, 2))
-        
-        # 测试按钮
-        tk.Button(
-            bottom_frame,
-            text="🧪测试",
-            command=self.test_auto_click,
-            bg='#9C27B0',
-            fg='white',
-            font=('微软雅黑', 7),
-            cursor='hand2'
-        ).pack(side=tk.LEFT, padx=2)
-        
-        # 状态显示
-        self.setup_status_label = tk.Label(
-            bottom_frame,
-            text="未设置",
-            font=('微软雅黑', 7),
-            fg='red'
-        )
+        tk.Label(opts, text="秒", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
+        self.setup_status_label = tk.Label(opts, text="● 未定位", font=(F, 7), bg=T['card'], fg=T['danger'])
         self.setup_status_label.pack(side=tk.RIGHT)
-        
-        # 4. 批改结果（更紧凑）
-        result_frame = tk.LabelFrame(main_frame, text="④ 结果", font=('微软雅黑', 8, 'bold'), padx=6, pady=4)
-        result_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 3))
-        
-        # 当前分数显示（更紧凑）
-        self.current_result_frame = tk.Frame(result_frame, bg='#fff3cd', relief=tk.RAISED, bd=1)
-        self.current_result_frame.pack(fill=tk.X, pady=(0, 3))
-        
-        self.current_score_label = tk.Label(
-            self.current_result_frame,
-            text="建议分数: --",
-            font=('微软雅黑', 14, 'bold'),
-            bg='#fff3cd',
-            fg='#ff6b00'
-        )
-        self.current_score_label.pack(pady=4)
-        
-        self.current_analysis_label = tk.Label(
-            self.current_result_frame,
-            text="",
-            font=('微软雅黑', 7),
-            bg='#fff3cd',
-            wraplength=460,
-            justify=tk.LEFT
-        )
+        self._btn(opts, "测试", self.test_auto_click, '#F1F5F9', fg=T['slate'], size=7,
+                  active=T['line']).pack(side=tk.RIGHT, padx=(0, 6))
+        self._btn(opts, "定位", self.setup_score_buttons, '#F1F5F9', fg=T['slate'], size=7,
+                  active=T['line']).pack(side=tk.RIGHT, padx=(0, 3))
+
+        # ===== ④ 结果 =====
+        _, body = self._card(main_frame, "④ 结果", expand=True)
+        self.current_result_frame = tk.Frame(body, bg=T['tint'])
+        self.current_result_frame.pack(fill=tk.X, pady=(0, 4))
+        self.current_score_label = tk.Label(self.current_result_frame, text="建议分数  --", font=(F, 13, 'bold'),
+                                            bg=T['tint'], fg=T['primary_d'])
+        self.current_score_label.pack(pady=(4, 0))
+        self.current_analysis_label = tk.Label(self.current_result_frame, text="", font=(F, 7), bg=T['tint'],
+                                               fg=T['slate'], wraplength=232, justify=tk.LEFT)
         self.current_analysis_label.pack(pady=(0, 4), padx=6)
-        
-        # 日志（更小）
-        tk.Label(result_frame, text="日志:", font=('微软雅黑', 7)).pack(anchor='w')
-        self.result_text = scrolledtext.ScrolledText(
-            result_frame,
-            height=8,
-            font=('微软雅黑', 7),
-            wrap=tk.WORD
-        )
+
+        self.result_text = scrolledtext.ScrolledText(body, height=8, font=(F, 7), wrap=tk.WORD, relief=tk.FLAT,
+                                                     bg='#F8FAFC', fg=T['slate'], highlightthickness=1,
+                                                     highlightbackground=T['line'])
         self.result_text.pack(fill=tk.BOTH, expand=True)
-        
-        # 5. 统计（更紧凑）
-        stats_frame = tk.Frame(main_frame, bg='#e3f2fd', relief=tk.FLAT, bd=1)
-        stats_frame.pack(fill=tk.X)
-        
-        self.stats_label = tk.Label(
-            stats_frame,
-            text="已批改: 0 | 用时: 0s | 平均: 0s | 效率: 0/h",
-            font=('微软雅黑', 7, 'bold'),
-            fg='#1976d2',
-            bg='#e3f2fd'
-        )
-        self.stats_label.pack(pady=2)
-        
-        # 初始提示
-        self.log("📌 快速开始：")
-        self.log("1. 截图设置答题区域（首次）")
-        self.log("2. 输入题号、满分、参考答案")
-        self.log("3. 点击⚙设置（设置输入框和提交按钮，首次）")
-        self.log("4. 点击🧪测试（验证功能，首次）")
-        self.log("5. 勾选'自动连续'+'自动点击'+'跳过确认'")
-        self.log("6. 按空格批改→全自动循环\n")
-        self.log("💡 确认模式：")
-        self.log("- 不勾选'跳过确认'：弹窗确认每个分数（安全）")
-        self.log("- 勾选'跳过确认'：直接提交，无需确认（高效）⚡\n")
-        self.log("💡 效率对比：")
-        self.log("- 需要确认：每份5-7秒，500-700份/小时")
-        self.log("- 跳过确认：每份3-4秒，900-1200份/小时⚡\n")
-    
+
+        # 初始提示（精简）
+        self.log("快速开始：")
+        self.log("1 框选答题区域  2 填题号/满分/参考答案")
+        self.log("3 定位输入框和提交按钮  4 点测试验证")
+        self.log("5 勾选连续+自动填分，按空格开始")
+        self.log("不勾跳过确认＝每份弹窗确认（安全）；勾上＝直接提交（高效）。")
+        self.log("鼠标甩到屏幕左上角 = 紧急停止；Esc = 停止。\n")
+
     def update_ui_from_config(self):
         """从配置更新界面显示"""
         # 1. 题目数据
@@ -688,9 +549,9 @@ class SimpleGradingUI:
         
         # 5. 自动提交设置状态
         if self.score_input_box and self.submit_button_pos:
-            self.setup_status_label.config(text="已设置", fg='green')
+            self.setup_status_label.config(text="● 已定位", fg=self.THEME['ok'])
         else:
-            self.setup_status_label.config(text="未设置", fg='red')
+            self.setup_status_label.config(text="● 未定位", fg=self.THEME['danger'])
             
         # 最后触发复选框回调(会触发保存)，确保所有UI都已更新
         self.on_checkbox_changed()
@@ -745,7 +606,7 @@ class SimpleGradingUI:
         """更新区域预览"""
         if self.answer_region:
             x, y, w, h = self.answer_region
-            self.region_preview.config(text=f"✓ 已设置: {w}x{h} 像素", fg='green', bg='#e8f5e9')
+            self.region_preview.config(text=f"✓ 已框选  {w}×{h}", fg=self.THEME['ok'], bg=self.THEME['ok_bg'])
     
     def grade_answer(self):
         """批改答案"""
@@ -862,7 +723,7 @@ class SimpleGradingUI:
             # 只在非自动连续模式下重置状态
             if not self.auto_continue:
                 self.is_grading = False
-                self.root.after(0, lambda: self.grade_btn.config(state=tk.NORMAL, text="🚀 批改当前学生 (空格)"))
+                self.root.after(0, lambda: self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT))
     
     def display_result(self, result, max_score, elapsed, model_name="Unknown"):
         """显示结果"""
@@ -877,7 +738,7 @@ class SimpleGradingUI:
         deductions = result.get('deduction_details', [])
         
         # 更新显示 (包含模型名称)
-        self.current_score_label.config(text=f"[{model_name}] 建议分数: {score}/{max_score}", bg='#fff3cd')
+        self.current_score_label.config(text=f"建议分数  {score} / {max_score}")
         
         detail_text = f"评语: {analysis}\n"
         if deductions:
@@ -1303,7 +1164,7 @@ class SimpleGradingUI:
             except Exception as e:
                 messagebox.showerror("错误", f"模型初始化失败: {str(e)}\n请检查Key或网络设置")
         
-        tk.Button(frame, text="保存配置", command=save, bg='#2196F3', fg='white', width=15).pack(pady=5)
+        tk.Button(frame, text="保存配置", command=save, bg=self.THEME['primary'], fg='white', activebackground=self.THEME['primary_d'], activeforeground='white', relief=tk.FLAT, bd=0, cursor='hand2', width=15, pady=3).pack(pady=5)
     
     def setup_score_buttons(self):
         """设置自动提交位置"""
@@ -1339,7 +1200,7 @@ class SimpleGradingUI:
         self.log(f"✓ 提交按钮位置: {self.submit_button_pos}")
         
         self.save_config()
-        self.setup_status_label.config(text="已设置", fg='green')
+        self.setup_status_label.config(text="● 已定位", fg=self.THEME['ok'])
         self.log("\n✓ 自动提交位置设置完成！")
         messagebox.showinfo("成功", "自动提交位置设置完成！\n\n建议点击'🧪 测试'按钮测试功能")
     
@@ -1379,10 +1240,10 @@ class SimpleGradingUI:
         self.auto_continue = self.auto_var.get()
         if self.auto_continue:
             self.log("✓ 已开启自动连续批改")
-            self.grade_btn.config(text="🚀 开始连续批改")
+            self.grade_btn.config(text="▶ 开始连续批改")
         else:
             self.log("⏸ 已关闭自动连续批改")
-            self.grade_btn.config(text="🚀 批改 (空格)")
+            self.grade_btn.config(text=self.GRADE_TEXT)
             # 关闭自动模式时禁用暂停按钮
             self.pause_btn.config(state=tk.DISABLED)
         
@@ -1394,10 +1255,10 @@ class SimpleGradingUI:
         self.is_paused = not self.is_paused
         
         if self.is_paused:
-            self.pause_btn.config(text="▶ 继续", bg='#4CAF50')
+            self.pause_btn.config(text="▶ 继续", bg=self.THEME['ok'], activebackground=self.THEME['ok'])
             self.log("\n⏸ 已暂停批改")
         else:
-            self.pause_btn.config(text="⏸ 暂停", bg='#2196F3')
+            self.pause_btn.config(text="⏸ 暂停", bg=self.THEME['slate'], activebackground=self.THEME['slate'])
             self.log("▶ 继续批改\n")
     
     def show_confirm_dialog(self, score, max_score, detail_text, force=False):
@@ -1410,7 +1271,7 @@ class SimpleGradingUI:
             else:
                 self.log(f"⚠ 自动点击未开启，请手动输入分数")
                 self.is_grading = False
-                self.grade_btn.config(state=tk.NORMAL, text="🚀 批改 (空格)")
+                self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT)
             self.waiting_for_confirm = False
             self.pending_score = None
             return
@@ -1476,7 +1337,7 @@ class SimpleGradingUI:
             else:
                 self.log(f"⚠ 自动点击未开启，请手动输入分数")
                 self.is_grading = False
-                self.grade_btn.config(state=tk.NORMAL, text="🚀 批改 (空格)")
+                self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT)
             
             self.waiting_for_confirm = False
             self.pending_score = None
@@ -1489,14 +1350,14 @@ class SimpleGradingUI:
             self.waiting_for_confirm = False
             self.pending_score = None
             self.is_grading = False
-            self.grade_btn.config(state=tk.NORMAL, text="🚀 批改当前学生 (空格)")
+            self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT)
         
         # 接受按钮
         accept_btn = tk.Button(
             btn_frame,
             text="✓ 接受 (Enter)",
             command=on_accept,
-            bg='#4CAF50',
+            bg=self.THEME['ok'], relief=tk.FLAT, bd=0,
             fg='white',
             font=('微软雅黑', 11, 'bold'),
             height=2,
@@ -1509,7 +1370,7 @@ class SimpleGradingUI:
             btn_frame,
             text="✗ 拒绝 (Esc)",
             command=on_reject,
-            bg='#f44336',
+            bg=self.THEME['danger'], relief=tk.FLAT, bd=0,
             fg='white',
             font=('微软雅黑', 11, 'bold'),
             height=2,
@@ -1624,7 +1485,7 @@ class SimpleGradingUI:
                 self.log(f"✓ 自动提交完成\n")
                 self.is_grading = False
                 self.ui(lambda: self.pause_btn.config(state=tk.DISABLED))
-                self.ui(lambda: self.grade_btn.config(state=tk.NORMAL, text="🚀 批改 (空格)"))
+                self.ui(lambda: self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT))
             
             return True
         except Exception as e:
@@ -1642,15 +1503,15 @@ class SimpleGradingUI:
         self.auto_continue = False
         self.is_paused = False
         self.auto_var.set(False)
-        self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停", bg='#2196F3')
-        self.grade_btn.config(state=tk.NORMAL, text="🚀 批改 (空格)")
+        self.pause_btn.config(state=tk.DISABLED, text="⏸ 暂停", bg=self.THEME['slate'])
+        self.grade_btn.config(state=tk.NORMAL, text=self.GRADE_TEXT)
         self.log("\n⏹ 批改已停止")
     
     def update_stats(self):
         """更新统计"""
         avg = self.total_time / self.grading_count if self.grading_count > 0 else 0
         eff = int(3600 / avg) if avg > 0 else 0
-        self.stats_label.config(text=f"已批改: {self.grading_count} | 用时: {self.total_time:.0f}s | 平均: {avg:.1f}s | 效率: {eff}/h")
+        self.stats_label.config(text=f"已批 {self.grading_count} · 用时 {self.total_time:.0f}s · 均 {avg:.1f}s · {eff}/h")
     
     def ui(self, fn):
         """在主线程执行 fn（后台线程调用界面一律走这里）"""
@@ -1691,7 +1552,7 @@ class SimpleGradingUI:
         if self.is_grading and not silent:
             messagebox.showwarning("在线更新", "正在批改，请先停止再更新")
             return
-        self.ui(lambda: self.update_btn.config(state=tk.DISABLED, text="…"))
+        self.ui(lambda: self.update_btn.config(state=tk.DISABLED, text="检查中"))
 
         def worker():
             try:
@@ -1702,15 +1563,15 @@ class SimpleGradingUI:
                     self.ui(lambda: messagebox.showerror("在线更新", err))
                 else:
                     self.log(f"（检查更新失败：{e}）")
-                self.ui(lambda: self.update_btn.config(state=tk.NORMAL, text="⬆"))
+                self.ui(lambda: self.update_btn.config(state=tk.NORMAL, text="更新"))
                 return
-            self.ui(lambda: self.update_btn.config(state=tk.NORMAL, text="⬆"))
+            self.ui(lambda: self.update_btn.config(state=tk.NORMAL, text="更新"))
             if not has_new:
                 if not silent:
                     self.ui(lambda: messagebox.showinfo("在线更新", f"已是最新版本 v{APP_VERSION}"))
                 return
             if silent:
-                self.ui(lambda: self.update_btn.config(text="⬆新", bg='#E53935'))
+                self.ui(lambda: self.update_btn.config(text="有新版", bg=self.THEME['danger'], activebackground=self.THEME['danger']))
             self.ui(lambda: self._ask_and_update(info, base))
 
         threading.Thread(target=worker, daemon=True).start()

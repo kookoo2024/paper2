@@ -1,9 +1,11 @@
 {
-  "version": "1.1.0",
-  "notes": "接入本机 Magpie；在线更新；批改/提交改到后台线程（修复暂停卡死）；扣分与得分不一致强制确认；防重复提交；超时与分数校验",
+  "version": "1.2.0",
+  "notes": "界面重新设计（紧凑卡片式、商务配色、顶栏不再重叠）；双击 start.pyw 启动无黑窗口；make_shortcut.bat 一键建桌面快捷方式",
   "files": {
-    "zhixue_simple.py": "3c497dbd0a5e8b446d4402f4397de75c64382965540f5e891a3e9a4047dc286c",
-    "README.md": "9e21168d2eb2a80b863c33b6bace91ec693e7a9b6777d79b3f546ed2ad675054",
+    "zhixue_simple.py": "c6cdbe96fb51bfbb4795b4b7504e1adb0424c530ea2faccd3bfdd0e0ccec47d6",
+    "start.pyw": "df2bda5027b52182584f74fc587977a484742792d53d8f21bd5a174012995249",
+    "make_shortcut.bat": "925555f845c456b3211ad06c624bf67a64f2f4fc58c5a35817995f169477f3c9",
+    "README.md": "b39cdbd95e26808f9775632f4ee77b6f1659befc0918d38d50b66e7b513e1f01",
     "requirements.txt": "9ed45a0f33585527bbb563d53c17a68d55ec63af2117c61d62204676c525328e"
   }
 }
