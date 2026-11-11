@@ -9,7 +9,10 @@ AI自动批改主观题，支持自动提交分数。
 pip install -r requirements.txt
 ```
 
-### 2. 运行程序
+### 2. 准备配置
+把 `zhixue_simple_config.example.json` 复制为 `zhixue_simple_config.json`（该文件已被 .gitignore 忽略，**API Key 只放这里，千万不要提交到 GitHub**）。
+
+### 3. 运行程序
 ```bash
 python zhixue_simple.py
 ```
@@ -50,6 +53,14 @@ python zhixue_simple.py
    - 按空格键开始批改
    - 自动提交，无需确认
    - 效率：900-1200份/小时
+
+## 接入本机 Magpie（推荐）
+
+[magpie](https://usemagpie.ai) 是本机的模型网关（127.0.0.1:3425），在 magpie 里配好 Gemini / DeepSeek / Qwen / Ollama 等，本程序只连 magpie 一个地址，Key 都留在 magpie 里。
+
+1. 打开 magpie 应用（或命令行 `magpie serve`），在里面添加至少一个**能识图**的模型（如 Gemini 2.5 Flash、Qwen-VL）
+2. 本程序点「模型设置」→ 提供商选 **Magpie** → 自动检测并获取模型列表
+3. 选一个能识图的模型 → 保存。API Key 默认 `magpie-zhixue`（本机任意值都行，用来在 magpie 的 Usage 里区分本程序的调用）
 
 ## 快捷键
 

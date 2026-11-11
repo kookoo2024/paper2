@@ -44,15 +44,83 @@ PROVIDERS = {
         "base_url": "https://api.siliconflow.cn/v1",
         "models": ["Qwen/Qwen2-VL-72B-Instruct", "Qwen/Qwen2-VL-7B-Instruct", "Qwen/Qwen3-VL-32B-Instruct", "Qwen/Qwen3-VL-32B-Thinking"]
     },
+    "Magpie": {
+        # 本机 magpie 网关（https://usemagpie.ai），任意 key 均可，用 magpie-<应用名> 方便在 Usage 里区分
+        "base_url": "http://127.0.0.1:3425/v1",
+        "default_key": "magpie-zhixue",
+        "models": []  # 运行时从 /v1/models 获取
+    },
     "Custom": {
         "base_url": "http://localhost:11434/v1",
         "models": []
     }
 }
 
+HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
+
+
+def http_open(req, timeout=HTTP_TIMEOUT):
+    """本机地址（magpie/Ollama）绕过系统代理，避免 v2rayN 等全局代理把 127.0.0.1 也转发出去"""
+    import urllib.request
+    from urllib.parse import urlparse
+    url = req.full_url if hasattr(req, "full_url") else req
+    if urlparse(url).hostname in ("127.0.0.1", "localhost", "::1"):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _magpie_port():
+    """读取 magpie settings.json 里的端口（只读），找不到返回 3425"""
+    import os
+    for base in (os.environ.get("XDG_CONFIG_HOME"), os.path.join(os.path.expanduser("~"), ".config")):
+        if not base:
+            continue
+        f = os.path.join(base, "magpie", "settings.json")
+        try:
+            with open(f, encoding="utf-8") as fp:
+                return int(json.load(fp).get("port", 3425))
+        except Exception:
+            pass
+    return 3425
+
+
+def magpie_detect(timeout=2):
+    """检测本机 magpie 是否在运行；在运行返回 (base_url, version)，否则 (None, None)"""
+    import urllib.request
+    port = _magpie_port()
+    try:
+        with http_open(f"http://127.0.0.1:{port}/api/hello", timeout=timeout) as r:
+            info = json.loads(r.read().decode("utf-8"))
+            if info.get("name") == "magpie":
+                return f"http://127.0.0.1:{port}/v1", info.get("version", "")
+    except Exception:
+        pass
+    return None, None
+
+
+def fetch_models(base_url, api_key, vision_only=True, timeout=10):
+    """从 OpenAI 兼容接口 /models 拉取模型列表（magpie / Ollama / LM Studio 等通用）。
+    vision_only=True 时优先返回能看图的模型（magpie 会在 modalities 里标注）。"""
+    import urllib.request
+    req = urllib.request.Request(f"{base_url.rstrip('/')}/models",
+                                 headers={"Authorization": f"Bearer {api_key or 'magpie-zhixue'}"})
+    with http_open(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8")).get("data", [])
+    ids = [m.get("id") for m in data if m.get("id")]
+    if vision_only:
+        vis = []
+        for m in data:
+            mods = m.get("modalities")
+            inputs = mods.get("input", []) if isinstance(mods, dict) else (mods or [])
+            if "image" in inputs:
+                vis.append(m["id"])
+        if vis:  # 有标注才过滤，否则全部返回
+            return vis
+    return ids
+
 
 # 配置 PyAutoGUI
-pyautogui.FAILSAFE = False  # 禁用安全功能
+pyautogui.FAILSAFE = True  # 鼠标甩到屏幕左上角可紧急中止（全自动模式下务必保留）
 pyautogui.PAUSE = 0.1  # 每次操作后暂停0.1秒
 
 
@@ -633,6 +701,13 @@ class SimpleGradingUI:
             # 截取学生答案
             x, y, w, h = self.answer_region
             student_img = pyautogui.screenshot(region=(x, y, w, h))
+            # 防重复：页面没翻到下一份时截图会和上一张一样，自动模式下直接停，避免同一份卷子重复提交
+            import hashlib
+            img_hash = hashlib.md5(student_img.tobytes()).hexdigest()
+            if self.auto_continue and img_hash == getattr(self, 'last_img_hash', None):
+                self.auto_continue = False
+                raise Exception("答案区域和上一份完全相同（可能没翻页或已批完），已停止自动连续批改")
+            self.last_img_hash = img_hash
             self.current_student_img = student_img # 保存引用以供导出
             
             # 构建提示
@@ -692,7 +767,13 @@ class SimpleGradingUI:
     
     def display_result(self, result, max_score, elapsed, model_name="Unknown"):
         """显示结果"""
-        score = result.get('score', 0)
+        try:
+            score = float(result.get('score', 0))
+        except (TypeError, ValueError):
+            score = 0
+        score = max(0, min(score, max_score))  # 防止模型给出超过满分或负分
+        if score == int(score):
+            score = int(score)
         analysis = result.get('analysis', '')
         deductions = result.get('deduction_details', [])
         
@@ -769,7 +850,7 @@ class SimpleGradingUI:
         if provider != 'Gemini':
             # 智能检测：如果模型不支持 Vision (如 DeepSeek-V3/Chat)，且在 SiliconFlow，则使用 Qwen-VL "借眼"
             is_text_model = any(k in model_name for k in ['DeepSeek-V3', 'DeepSeek-V2', 'chat', 'coder'])
-            is_siliconflow = 'silicon' in base_url or api_key.startswith('sk-') 
+            is_siliconflow = 'silicon' in base_url and provider != 'Magpie'
             
             if is_text_model and is_siliconflow:
                 # 尝试 Vision Relay (OCR -> Text Model)
@@ -795,6 +876,11 @@ class SimpleGradingUI:
             # 常规 Vision 调用 (OpenAI Compatible)
             if not base_url and provider in PROVIDERS:
                 base_url = PROVIDERS[provider]['base_url']
+            if provider == 'Magpie':
+                if not api_key:
+                    api_key = PROVIDERS['Magpie']['default_key']
+                if not model_name:
+                    raise Exception("Magpie 未选择模型：请在“模型设置”里点“获取模型”并选一个能识图的模型")
             
             import urllib.request
             import urllib.error
@@ -825,17 +911,19 @@ class SimpleGradingUI:
             data = {
                 "model": model_name,
                 "messages": messages,
-                "max_tokens": 4096 
+                "max_tokens": 4096,
+                "temperature": 0  # 阅卷要稳定，同一份卷子多次评分应一致
             }
             
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "ZhixueGrader/1.0"
             }
             
             try:
                 req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-                with urllib.request.urlopen(req) as response:
+                with http_open(req) as response:
                     result_str = response.read().decode('utf-8')
                     result_json = json.loads(result_str)
                     content = result_json['choices'][0]['message']['content']
@@ -880,7 +968,7 @@ class SimpleGradingUI:
         }
         
         req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-        with urllib.request.urlopen(req) as response:
+        with http_open(req) as response:
             res = json.loads(response.read().decode('utf-8'))
             return res['choices'][0]['message']['content']
 
@@ -901,7 +989,7 @@ class SimpleGradingUI:
         }
         
         req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
-        with urllib.request.urlopen(req) as response:
+        with http_open(req) as response:
             res = json.loads(response.read().decode('utf-8'))
             content = res['choices'][0]['message']['content']
             if need_json:
@@ -940,7 +1028,7 @@ class SimpleGradingUI:
         """设置模型和API"""
         dialog = tk.Toplevel(self.root)
         dialog.title("模型设置")
-        dialog.geometry("300x500")
+        dialog.geometry("320x600")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -993,6 +1081,36 @@ class SimpleGradingUI:
         current_models = PROVIDERS.get(current_provider, {}).get("models", [])
         model_combo['values'] = current_models
         model_combo.set(initial_model)
+
+        status_lbl = tk.Label(frame, text="", font=('微软雅黑', 8), fg='#666', justify=tk.LEFT, wraplength=260)
+
+        def refresh_models():
+            """从当前 Base URL 拉取模型（Magpie / Custom 等 OpenAI 兼容接口）"""
+            p = provider_combo.get()
+            url = url_entry.get().strip()
+            if p == 'Magpie':
+                found, ver = magpie_detect()
+                if not found:
+                    status_lbl.config(text="❌ 没检测到 magpie，请先打开 magpie 应用或运行 magpie serve", fg='#c00')
+                    return
+                if not url:
+                    url = found
+                    url_entry.insert(0, url)
+            if not url:
+                status_lbl.config(text="请先填写 Base URL", fg='#c00')
+                return
+            try:
+                models = fetch_models(url, key_entry.get().strip())
+            except Exception as e:
+                status_lbl.config(text=f"❌ 获取失败：{e}", fg='#c00')
+                return
+            model_combo['values'] = models
+            if models and model_combo.get() not in models:
+                model_combo.set(models[0])
+            status_lbl.config(text=f"✓ 获取到 {len(models)} 个模型（批改需选能识图的模型）", fg='#2e7d32')
+
+        tk.Button(frame, text="🔄 获取模型", command=refresh_models).pack(anchor='w', pady=(0, 4))
+        status_lbl.pack(anchor='w', pady=(0, 8))
         
         # 联动更新逻辑
         def on_provider_change(event):
@@ -1019,8 +1137,8 @@ class SimpleGradingUI:
             url_entry.delete(0, tk.END)
             url_entry.insert(0, new_url)
             
-            # Key
-            new_key = settings.get('api_key', '')
+            # Key（Magpie 本机任意 key 都行，默认填 magpie-zhixue）
+            new_key = settings.get('api_key', '') or PROVIDERS.get(new_p, {}).get('default_key', '')
             key_entry.delete(0, tk.END)
             key_entry.insert(0, new_key)
             
@@ -1038,11 +1156,15 @@ class SimpleGradingUI:
             
             # 更新引用
             last_provider_ref[0] = new_p
+
+            # Magpie / Custom 自动拉取模型
+            if new_p in ('Magpie', 'Custom'):
+                dialog.after(50, refresh_models)
                 
         provider_combo.bind("<<ComboboxSelected>>", on_provider_change)
         
         # 说明
-        tk.Label(frame, text="说明：\nGemini无需Base URL\nDeepSeek需配置对应URL\n切换时会自动暂存当前输入", 
+        tk.Label(frame, text="说明：\nGemini无需Base URL\nMagpie：先打开本机 magpie，选它后点“获取模型”\n切换时会自动暂存当前输入", 
                  font=('微软雅黑', 8), fg='#666', justify=tk.LEFT).pack(anchor='w', pady=(0, 15))
         
         def save():
@@ -1287,7 +1409,8 @@ class SimpleGradingUI:
     
     def auto_click_score(self, score):
         """自动输入分数并提交"""
-        score = int(score)
+        score = float(score)
+        score = int(score) if score == int(score) else score  # 支持 0.5 分
         
         if not self.score_input_box or not self.submit_button_pos:
             self.log("⚠ 未设置自动提交位置")
