@@ -59,7 +59,7 @@ PROVIDERS = {
 HTTP_TIMEOUT = 120  # 秒，防止网络卡住时程序假死
 
 # ================= 在线更新 =================
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -338,21 +338,27 @@ class SimpleGradingUI:
     
     # ---------- 界面样式 ----------
     THEME = {
-        'bg': '#F3F5F9',        # 窗口底色
+        'bg': '#EEF2FF',        # 窗口底色（淡紫蓝）
         'card': '#FFFFFF',      # 卡片
-        'line': '#E2E8F0',      # 描边
-        'text': '#1E293B',      # 正文
-        'sub': '#64748B',       # 次要文字
-        'head': '#0F172A',      # 顶栏
-        'head2': '#1E293B',     # 顶栏按钮
-        'primary': '#2563EB',   # 主色
-        'primary_d': '#1D4ED8',
-        'ok': '#059669',
-        'ok_bg': '#ECFDF5',
-        'warn': '#D97706',
-        'danger': '#DC2626',
-        'slate': '#475569',
-        'tint': '#EFF4FF',      # 浅蓝底
+        'line': '#DDE3F5',      # 描边
+        'text': '#22223B',      # 正文
+        'sub': '#6B6F8E',       # 次要文字
+        'head': '#5B5FEF',      # 顶栏 / 底栏（亮靛蓝）
+        'head2': '#7B7FFF',     # 顶栏按钮
+        'badge': '#FFD23F',     # 版本标签（明黄）
+        'primary': '#FF6B35',   # 批改主按钮（活力橙）
+        'primary_d': '#E8551F',
+        'cyan': '#00B8D9',      # ① 答题区域
+        'purple': '#8B5CF6',    # ② 题目 / 暂停
+        'orange': '#FF6B35',    # ③ 批改
+        'green': '#10C98F',     # ④ 结果
+        'ok': '#10B981',
+        'ok_bg': '#E7FBF3',
+        'warn': '#FF8A00',
+        'danger': '#FF3D71',
+        'slate': '#8B5CF6',     # 暂停按钮
+        'tint': '#FFF3EC',      # 分数卡底色（浅橙）
+        'input': '#F7F8FF',     # 输入框
     }
     FONT = '微软雅黑'
     GRADE_TEXT = "▶ 批改  (空格)"
@@ -366,19 +372,19 @@ class SimpleGradingUI:
 
     def _entry(self, parent, width):
         T = self.THEME
-        return tk.Entry(parent, width=width, font=(self.FONT, 9), relief=tk.FLAT, bg='#F8FAFC', fg=T['text'],
+        return tk.Entry(parent, width=width, font=(self.FONT, 9), relief=tk.FLAT, bg=T['input'], fg=T['text'],
                         highlightthickness=1, highlightbackground=T['line'], highlightcolor=T['primary'],
                         insertbackground=T['text'])
 
-    def _card(self, parent, title, hint=None, expand=False):
+    def _card(self, parent, title, hint=None, expand=False, color=None):
         """卡片式分组：白底细边框 + 小标题，返回内容区"""
         T = self.THEME
         outer = tk.Frame(parent, bg=T['card'], highlightthickness=1, highlightbackground=T['line'])
         outer.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(0, 6))
         head = tk.Frame(outer, bg=T['card'])
         head.pack(fill=tk.X, padx=8, pady=(5, 2))
-        tk.Frame(head, bg=T['primary'], width=3, height=12).pack(side=tk.LEFT, padx=(0, 5))
-        tk.Label(head, text=title, font=(self.FONT, 8, 'bold'), bg=T['card'], fg=T['text']).pack(side=tk.LEFT)
+        tk.Frame(head, bg=color or T['primary'], width=4, height=13).pack(side=tk.LEFT, padx=(0, 5))
+        tk.Label(head, text=title, font=(self.FONT, 8, 'bold'), bg=T['card'], fg=color or T['text']).pack(side=tk.LEFT)
         if hint:
             tk.Label(head, text=hint, font=(self.FONT, 7), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT, padx=(5, 0))
         body = tk.Frame(outer, bg=T['card'])
@@ -395,39 +401,39 @@ class SimpleGradingUI:
         bar.pack(fill=tk.X)
         bar.pack_propagate(False)
         tk.Label(bar, text="阅卷", font=(F, 13, 'bold'), bg=T['head'], fg='white').pack(side=tk.LEFT, padx=(12, 4))
-        tk.Label(bar, text=f"V{APP_VERSION}", font=('Consolas', 7, 'bold'), bg=T['head2'], fg='#93C5FD',
+        tk.Label(bar, text=f"V{APP_VERSION}", font=('Consolas', 7, 'bold'), bg=T['badge'], fg=T['text'],
                  padx=4, pady=1).pack(side=tk.LEFT, pady=(4, 0))
 
         tools = tk.Frame(bar, bg=T['head'])
         tools.pack(side=tk.RIGHT, padx=8)
         self.update_btn = self._btn(tools, "更新", lambda: self.check_update_ui(silent=False), T['head2'],
-                                    active=T['primary'], padx=7, pady=3)
+                                    active='#4A4ED8', padx=7, pady=3)
         self.update_btn.pack(side=tk.RIGHT)
-        self._btn(tools, "笔记", self.setup_obsidian_path, T['head2'], active=T['primary'],
+        self._btn(tools, "笔记", self.setup_obsidian_path, T['head2'], active='#4A4ED8',
                   padx=7, pady=3).pack(side=tk.RIGHT, padx=(0, 3))
-        self._btn(tools, "模型", self.setup_model, T['head2'], active=T['primary'],
+        self._btn(tools, "模型", self.setup_model, T['head2'], active='#4A4ED8',
                   padx=7, pady=3).pack(side=tk.RIGHT, padx=(0, 3))
 
         # ===== 底部状态栏 =====
         status = tk.Frame(self.root, bg=T['head'])
         status.pack(fill=tk.X, side=tk.BOTTOM)
         self.stats_label = tk.Label(status, text="已批 0 · 用时 0s · 均 0s · 0/h", font=(F, 7),
-                                    fg='#CBD5E1', bg=T['head'])
+                                    fg='white', bg=T['head'])
         self.stats_label.pack(pady=2)
 
         main_frame = tk.Frame(self.root, bg=T['bg'], padx=8, pady=8)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # ===== ① 答题区域 =====
-        _, body = self._card(main_frame, "① 答题区域")
-        self.region_preview = tk.Label(body, text="未框选", bg=T['tint'], fg=T['sub'], font=(F, 8),
+        _, body = self._card(main_frame, "① 答题区域", color=T['cyan'])
+        self.region_preview = tk.Label(body, text="未框选", bg='#E6F9FD', fg=T['sub'], font=(F, 8),
                                        anchor='w', padx=6, pady=2)
         self.region_preview.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._btn(body, "框选", self.setup_region, T['primary'], active=T['primary_d'],
+        self._btn(body, "框选", self.setup_region, T['cyan'], active='#0097B2',
                   padx=10, pady=2).pack(side=tk.RIGHT, padx=(6, 0))
 
         # ===== ② 题目 =====
-        _, body = self._card(main_frame, "② 题目", hint="自动保存", expand=True)
+        _, body = self._card(main_frame, "② 题目", hint="自动保存", expand=True, color=T['purple'])
         row = tk.Frame(body, bg=T['card'])
         row.pack(fill=tk.X, pady=(0, 4))
         tk.Label(row, text="题号", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
@@ -441,12 +447,12 @@ class SimpleGradingUI:
         row2.pack(fill=tk.X, pady=(0, 2))
         tk.Label(row2, text="参考答案", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
         self._btn(row2, "清空", lambda: (self.answer_text.delete('1.0', tk.END), self.save_question_data()),
-                  '#F1F5F9', fg=T['slate'], size=7, active=T['line']).pack(side=tk.RIGHT)
-        self._btn(row2, "截图识别", self.capture_standard_answer, T['tint'], fg=T['primary'], size=7,
-                  active='#DBEAFE').pack(side=tk.RIGHT, padx=(0, 4))
+                  '#F1EEFF', fg=T['purple'], size=7, active='#E4DDFF').pack(side=tk.RIGHT)
+        self._btn(row2, "截图识别", self.capture_standard_answer, T['purple'], size=7,
+                  active='#7342E8').pack(side=tk.RIGHT, padx=(0, 4))
 
         self.answer_text = scrolledtext.ScrolledText(body, height=3, font=(F, 8), wrap=tk.WORD, relief=tk.FLAT,
-                                                     bg='#F8FAFC', fg=T['text'], highlightthickness=1,
+                                                     bg=T['input'], fg=T['text'], highlightthickness=1,
                                                      highlightbackground=T['line'], highlightcolor=T['primary'])
         self.answer_text.pack(fill=tk.BOTH, expand=True)
 
@@ -455,20 +461,20 @@ class SimpleGradingUI:
             w.bind('<KeyRelease>', lambda e: self.save_question_data())
 
         # ===== ③ 批改控制 =====
-        _, body = self._card(main_frame, "③ 批改")
+        _, body = self._card(main_frame, "③ 批改", color=T['orange'])
         btns = tk.Frame(body, bg=T['card'])
         btns.pack(fill=tk.X, pady=(0, 5))
         self.grade_btn = self._btn(btns, self.GRADE_TEXT, self.grade_answer, T['primary'], size=10, bold=True,
                                    active=T['primary_d'], pady=4)
         self.grade_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
         self.pause_btn = self._btn(btns, "⏸ 暂停", self.toggle_pause, T['slate'], size=9, bold=True,
-                                   pady=4, state=tk.DISABLED, disabledforeground='#CBD5E1')
+                                   pady=4, state=tk.DISABLED, disabledforeground='#E4DDFF')
         self.pause_btn.pack(side=tk.LEFT, ipadx=4)
 
         checks = tk.Frame(body, bg=T['card'])
         checks.pack(fill=tk.X, pady=(0, 3))
         ck = dict(font=(F, 8), bg=T['card'], fg=T['text'], activebackground=T['card'],
-                  selectcolor='white', bd=0, highlightthickness=0)
+                  selectcolor='#FFF3EC', bd=0, highlightthickness=0)
         self.auto_var = tk.BooleanVar(value=False)
         tk.Checkbutton(checks, text="连续", variable=self.auto_var, command=self.on_checkbox_changed, **ck).pack(side=tk.LEFT)
         self.auto_click_var = tk.BooleanVar(value=False)
@@ -487,24 +493,24 @@ class SimpleGradingUI:
         tk.Label(opts, text="秒", font=(F, 8), bg=T['card'], fg=T['sub']).pack(side=tk.LEFT)
         self.setup_status_label = tk.Label(opts, text="● 未定位", font=(F, 7), bg=T['card'], fg=T['danger'])
         self.setup_status_label.pack(side=tk.RIGHT)
-        self._btn(opts, "测试", self.test_auto_click, '#F1F5F9', fg=T['slate'], size=7,
-                  active=T['line']).pack(side=tk.RIGHT, padx=(0, 6))
-        self._btn(opts, "定位", self.setup_score_buttons, '#F1F5F9', fg=T['slate'], size=7,
-                  active=T['line']).pack(side=tk.RIGHT, padx=(0, 3))
+        self._btn(opts, "测试", self.test_auto_click, '#FFF0E8', fg=T['orange'], size=7,
+                  active='#FFE0D0').pack(side=tk.RIGHT, padx=(0, 6))
+        self._btn(opts, "定位", self.setup_score_buttons, '#FFF0E8', fg=T['orange'], size=7,
+                  active='#FFE0D0').pack(side=tk.RIGHT, padx=(0, 3))
 
         # ===== ④ 结果 =====
-        _, body = self._card(main_frame, "④ 结果", expand=True)
+        _, body = self._card(main_frame, "④ 结果", expand=True, color=T['green'])
         self.current_result_frame = tk.Frame(body, bg=T['tint'])
         self.current_result_frame.pack(fill=tk.X, pady=(0, 4))
         self.current_score_label = tk.Label(self.current_result_frame, text="建议分数  --", font=(F, 13, 'bold'),
-                                            bg=T['tint'], fg=T['primary_d'])
+                                            bg=T['tint'], fg=T['primary'])
         self.current_score_label.pack(pady=(4, 0))
         self.current_analysis_label = tk.Label(self.current_result_frame, text="", font=(F, 7), bg=T['tint'],
-                                               fg=T['slate'], wraplength=232, justify=tk.LEFT)
+                                               fg=T['sub'], wraplength=232, justify=tk.LEFT)
         self.current_analysis_label.pack(pady=(0, 4), padx=6)
 
         self.result_text = scrolledtext.ScrolledText(body, height=8, font=(F, 7), wrap=tk.WORD, relief=tk.FLAT,
-                                                     bg='#F8FAFC', fg=T['slate'], highlightthickness=1,
+                                                     bg=T['input'], fg=T['sub'], highlightthickness=1,
                                                      highlightbackground=T['line'])
         self.result_text.pack(fill=tk.BOTH, expand=True)
 
@@ -1164,7 +1170,7 @@ class SimpleGradingUI:
             except Exception as e:
                 messagebox.showerror("错误", f"模型初始化失败: {str(e)}\n请检查Key或网络设置")
         
-        tk.Button(frame, text="保存配置", command=save, bg=self.THEME['primary'], fg='white', activebackground=self.THEME['primary_d'], activeforeground='white', relief=tk.FLAT, bd=0, cursor='hand2', width=15, pady=3).pack(pady=5)
+        tk.Button(frame, text="保存配置", command=save, bg=self.THEME['head'], fg='white', activebackground='#4A4ED8', activeforeground='white', relief=tk.FLAT, bd=0, cursor='hand2', width=15, pady=3).pack(pady=5)
     
     def setup_score_buttons(self):
         """设置自动提交位置"""

@@ -1,8 +1,8 @@
 {
-  "version": "1.2.0",
-  "notes": "界面重新设计（紧凑卡片式、商务配色、顶栏不再重叠）；双击 start.pyw 启动无黑窗口；make_shortcut.bat 一键建桌面快捷方式",
+  "version": "1.2.1",
+  "notes": "配色改为鲜艳活泼风：靛蓝顶栏、明黄版本标签、四块卡片各用青/紫/橙/绿主题色，橙色批改大按钮",
   "files": {
-    "zhixue_simple.py": "c6cdbe96fb51bfbb4795b4b7504e1adb0424c530ea2faccd3bfdd0e0ccec47d6",
+    "zhixue_simple.py": "e866a1fedd74cbedbaedf944b7352cfb24b22b86f0ce32ce552da97c1def85c0",
     "start.pyw": "df2bda5027b52182584f74fc587977a484742792d53d8f21bd5a174012995249",
     "make_shortcut.bat": "925555f845c456b3211ad06c624bf67a64f2f4fc58c5a35817995f169477f3c9",
     "README.md": "b39cdbd95e26808f9775632f4ee77b6f1659befc0918d38d50b66e7b513e1f01",
