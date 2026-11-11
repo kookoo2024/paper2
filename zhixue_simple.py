@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
 PROVIDERS = {
     "Gemini": {
         "base_url": "",
-        "models": ["gemini-2.5-flash", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-pro"]
+        "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
     },
 
     "DeepSeek": {
@@ -44,7 +44,7 @@ PROVIDERS = {
     },
     "SiliconFlow": {
         "base_url": "https://api.siliconflow.cn/v1",
-        "models": ["Qwen/Qwen2-VL-72B-Instruct", "Qwen/Qwen2-VL-7B-Instruct", "Qwen/Qwen3-VL-32B-Instruct", "Qwen/Qwen3-VL-32B-Thinking"]
+        "models": ["Qwen/Qwen2.5-VL-72B-Instruct", "Qwen/Qwen2.5-VL-32B-Instruct", "Qwen/Qwen3-VL-32B-Instruct", "Qwen/Qwen2-VL-72B-Instruct"]
     },
     "Magpie": {
         # 本机 magpie 网关（https://usemagpie.ai），任意 key 均可，用 magpie-<应用名> 方便在 Usage 里区分
@@ -58,10 +58,11 @@ PROVIDERS = {
     }
 }
 
+GEMINI_OPENAI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 HTTP_TIMEOUT = 120  # 秒：连续这么久收不到任何数据才算超时（流式接收，长回答不会被误判）
 
 # ================= 在线更新 =================
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
 # 依次尝试：GitHub 原始地址 → jsDelivr 镜像（国内直连更稳，但可能有几小时缓存）
@@ -146,6 +147,9 @@ def image_to_data_url(image, max_side=1600):
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+STATS = {}   # 最近一次请求的耗时统计，用于日志诊断
+
+
 def post_chat_plain(url, data, headers):
     import json
     body = dict(data)
@@ -175,6 +179,7 @@ def post_chat_stream(url, data, headers, log=None):
     req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers=headers)
     t0 = last_report = time.time()
     parts, think_chars, finish = [], 0, None
+    STATS.update(first=None, think=0, chars=0, t0=t0)
     with http_open(req) as resp:
         ctype = resp.headers.get('Content-Type', '')
         if 'event-stream' not in ctype:
@@ -202,6 +207,8 @@ def post_chat_stream(url, data, headers, log=None):
                 if isinstance(c, list):   # 少数接口把内容拆成数组
                     c = ''.join(x.get('text', '') for x in c if isinstance(x, dict))
                 if c:
+                    if STATS['first'] is None:
+                        STATS['first'] = time.time() - t0
                     parts.append(c)
                 rc = d.get('reasoning_content') or d.get('reasoning')
                 if rc:
@@ -217,6 +224,7 @@ def post_chat_stream(url, data, headers, log=None):
                 else:
                     log(f"  …等待模型回应（{time.time() - t0:.0f} 秒）")
     text = ''.join(parts)
+    STATS.update(think=think_chars, chars=len(text))
     if text.strip():
         return text
     if think_chars:
@@ -224,6 +232,21 @@ def post_chat_stream(url, data, headers, log=None):
     if log:
         log("  流式没拿到内容，改用普通方式再请求一次…")
     return post_chat_plain(url, data, headers)
+
+
+def no_think_params(model_name, base_url):
+    """尽量关掉模型的“思考”：阅卷是看图打分，不需要长推理，开着思考一份要几十秒甚至几分钟"""
+    m = (model_name or '').lower()
+    u = (base_url or '').lower()
+    if 'siliconflow' in u:
+        return {"enable_thinking": False}
+    if 'gemini-2.5' in m or 'gemini-3' in m:
+        return {"reasoning_effort": "none"} if 'pro' not in m else {"reasoning_effort": "low"}
+    if m.startswith(('gpt-5', 'o3', 'o4')) or '/gpt-5' in m:
+        return {"reasoning_effort": "minimal"}
+    if 'qwen3' in m or 'glm-4.5v' in m or 'glm-4.1v' in m:
+        return {"enable_thinking": False}
+    return {}
 
 
 def is_retryable(err):
@@ -1193,6 +1216,17 @@ class SimpleGradingUI:
             self.total_time += elapsed
             
             model_name = self.config.get('model_name', 'Unknown')
+            st = dict(STATS)
+            if st.get('t0'):
+                first = st.get('first')
+                msg = f"  ⏱ 共 {elapsed:.1f} 秒（等第一个字 {first:.1f} 秒" if first is not None else f"  ⏱ 共 {elapsed:.1f} 秒（"
+                msg += f"，输出 {st.get('chars', 0)} 字"
+                if st.get('think'):
+                    msg += f"，另外思考了 {st['think']} 字"
+                self.log(msg + f"）· {model_name}")
+            if elapsed > 20:
+                self.log("  ⚠ 这一份超过 20 秒，模型偏慢。" + ("它在“思考”，建议换非思考模型。" if st.get('think') else
+                         "可在「模型」里换 gemini-2.5-flash / Qwen2.5-VL 这类快速识图模型。"))
             self.root.after(0, lambda: self.display_result(result, max_score, elapsed, model_name))
             
         except Exception as e:
@@ -1288,21 +1322,14 @@ class SimpleGradingUI:
                  api_key = DEFAULT_CONFIG['api_key']
         
         if provider == 'Gemini':
-            # Gemini 必须先初始化 self.model
-            if not hasattr(self, 'model'):
-                self.init_model()
-                
-            response = self.model.generate_content([prompt, image])
-            text = response.text
-            if need_json:
-                return self.parse_json_result(text)
-            else:
-                return text
-            
-        if provider != 'Gemini':
+            # 走 Gemini 的 OpenAI 兼容接口：可以关掉思考、流式接收、统一计时和重试
+            base_url = GEMINI_OPENAI_URL
+            model_name = model_name or 'gemini-2.5-flash'
+
+        if True:
             # 智能检测：如果模型不支持 Vision (如 DeepSeek-V3/Chat)，且在 SiliconFlow，则使用 Qwen-VL "借眼"
             is_text_model = any(k in model_name for k in ['DeepSeek-V3', 'DeepSeek-V2', 'chat', 'coder'])
-            is_siliconflow = 'silicon' in base_url and provider != 'Magpie'
+            is_siliconflow = 'silicon' in base_url and provider not in ('Magpie', 'Gemini')
             
             if is_text_model and is_siliconflow:
                 # 尝试 Vision Relay (OCR -> Text Model)
@@ -1345,8 +1372,10 @@ class SimpleGradingUI:
             ]}]
             data = {"model": model_name, "messages": messages, "max_tokens": 4096,
                     "temperature": 0}  # 阅卷要稳定，同一份卷子多次评分应一致
-            if 'siliconflow' in base_url:
-                data["enable_thinking"] = False   # 硅基流动上的混合思考模型：关掉思考，快很多
+            bad = getattr(self, '_bad_params', set())
+            for k, v in no_think_params(model_name, base_url).items():
+                if (model_name, k) not in bad:
+                    data[k] = v
             headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
                        "User-Agent": "ZhixueGrader/1.0"}
 
@@ -1357,8 +1386,14 @@ class SimpleGradingUI:
                     return self.parse_json_result(content) if need_json else content
                 except urllib.error.HTTPError as e:
                     msg = e.read().decode('utf-8', 'ignore')[:300]
-                    if e.code == 400 and data.pop("enable_thinking", None) is not None:
-                        continue   # 这个模型不认 enable_thinking，去掉再试
+                    extra = [k for k in ("enable_thinking", "reasoning_effort") if k in data]
+                    if e.code == 400 and 'temperature' in msg and 'temperature' in data:
+                        extra.append('temperature')   # 部分模型（如 gpt-5）只接受默认温度
+                    if e.code == 400 and extra:
+                        for k in extra:   # 这个模型不认关思考的参数：去掉再试，并记住下次不再带
+                            data.pop(k)
+                            self._bad_params = getattr(self, '_bad_params', set()) | {(model_name, k)}
+                        continue
                     last = Exception(f"API Error {e.code}: {msg}")
                 except Exception as e:
                     last = e if str(e).startswith(("API", "模型")) else Exception(f"API Call Failed: {e}")
