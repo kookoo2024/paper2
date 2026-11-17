@@ -173,6 +173,42 @@ check("没有指南时提示词不出现指南段", "【批改指南" not in p0 
 check("有指南时带原题和指南", "题目原文QQ" in p1 and "指南GG" in p1)
 check("识别提示词要求 LaTeX", "LaTeX" in gc.capture_prompt("answer") and "不要解答" in gc.capture_prompt("question"))
 
+# ---- v1.13 给分点格式 / 材料箱 ----
+pt = """（1）满分 6 分
+解法一：设点法
+求得 $k=2$｜2
+写出直线方程 $y=2x+1$｜4
+解法二：参数法
+设参数并联立｜3（AI拟分）
+得出结论｜3 (AI拟分)
+（2）满分 6 分
+联立得 $x^2-4x+3=0$｜6
+评分说明：
+最多得 11 分"""
+c, iss, ai = gc.card_from_points_text(pt, 12)
+check("新格式解析：2 问，第 1 问 2 套解法", not iss and len(c["parts"]) == 2 and len(c["parts"][0]["methods"]) == 2, str(iss))
+check("AI 拟分的行能找出来", len(ai) == 2)
+check("评分说明里的封顶", c["score_cap"] == 11)
+check("去掉 AI 拟分标记", "AI" not in gc.strip_ai_marks(pt))
+_, iss2, _ = gc.card_from_points_text(pt.replace("｜4", "｜3"), 12)
+check("解法合计≠小问满分能查出来", any("合计" in x for x in iss2), str(iss2))
+_, iss3, _ = gc.card_from_points_text(pt.replace("（2）满分 6 分", "（2）满分 5 分").replace("｜6", "｜5"), 12)
+check("各问合计≠本题满分能查出来", any("本题满分" in x for x in iss3), str(iss3))
+_, iss4, _ = gc.card_from_points_text("（1）满分 2 分\n乱写一行\nx｜2", 2)
+check("看不懂的行会报出来", any("看不懂" in x for x in iss4), str(iss4))
+check("旧写法不算新格式", not gc.is_points_text("求得 k=2｜2\n直线方程｜4"))
+check("全题写法", not gc.card_from_points_text("全题 满分 5 分\na｜2\nb｜3", 5)[1])
+r = {"parts": [{"part_id": "1", "method_id": "1-B", "points": [{"point_id": "1-B-1", "got": 3}, {"point_id": "1-B-2", "got": 0}]},
+               {"part_id": "2", "method_id": "2-A", "points": [{"point_id": "2-A-1", "got": 6}]}]}
+s13, _, _, rv = gc.settle(r, c, 12)
+check("按解法二判分并加总", s13 == 9 and not rv, f"{s13} {rv}")
+p13 = gc.build_prompt("18", 12, "ans", c)
+check("提示词里列出两套解法", "1-B" in p13 and "设参数并联立" in p13)
+sec = gc.parse_sections("```\n===原题===\nQ\n===参考答案===\nA\n===给分点===\nP\n===批改指南===\nG\n```")
+check("四段输出解析", sec == {"原题": "Q", "参考答案": "A", "给分点": "P", "批改指南": "G"}, str(sec))
+mp = gc.build_materials_prompt("18", 12, "老师的文字", 3)
+check("材料箱提示词", "3 张截图" in mp and "老师的文字" in mp and "===给分点===" in mp and gc.AI_MARK in mp)
+
 print()
 print("全部通过" if not failures else f"{len(failures)} 项失败")
 sys.exit(1 if failures else 0)

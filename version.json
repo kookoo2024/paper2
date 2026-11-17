@@ -1,10 +1,10 @@
 {
-  "version": "1.12.0",
-  "notes": "新增原题+批改指南：截原题后AI一次生成统一格式的参考答案和每个得分步骤的批改指南，程序核对分值不变，老师确认后批改时一起发给模型（仍一次请求）；截图识别统一输出 LaTeX 格式；指南随原题/答案/给分点变动自动过期",
+  "version": "1.13.0",
+  "notes": "材料箱：原题、官方答案、手写解法多张截图+文字一起放，一键生成原题、统一格式参考答案（多解法）、给分点、批改指南，预览核对后确认；去掉评分卡窗口，给分点框即评分卡（（1）满分N分/解法一：/要点｜分值），格式错误批改会停下提示；学生用哪套解法按哪套判",
   "files": {
-    "zhixue_simple.py": "f8fb8456db79b50f9a588cb5fb46fe79a077d4b020906aef1f42f19c1dc2e6b6",
-    "grading_core.py": "54a586591a246b8bd593fc863097680f831084129550b12943117cae97933349",
-    "README.md": "2323b413ecd169469bf0c5751f75833f3f55648aa54e533d00bcda8d0e8506e8",
+    "zhixue_simple.py": "b6cf2b47dcec2c4a7d33f9e8ad813a9eec39ae6ffc4c925990d8512bc124a923",
+    "grading_core.py": "a4255cb0eeea2cf7b9662f5c2a61e276caa0a11bf72104675a16f1ba346ac2fb",
+    "README.md": "39be4a5f4b7f9e0401d14cf20b1a52861a4f337c25fedf2f813facaacba0c8a2",
     "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3",
     "eval.py": "6916dd5ff23ba3591f60be84d0e901a956493d17b562231ce7a387c121a2d675"
   }

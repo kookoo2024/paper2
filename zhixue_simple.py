@@ -25,7 +25,8 @@ import grading_core as gc
 
 HTTP_TIMEOUT = 120  # 兜底超时（秒）；批改调用会传更短的 15 秒目标
 GRADE_TIMEOUT = 20  # 单题批改硬上限：超过就中止
-PREP_TIMEOUT = 90   # 备课用（截图识别、生成批改指南）：只做一次，可以慢一点
+PREP_TIMEOUT = 90   # 备课用（截图识别）：只做一次，可以慢一点
+PREP_LONG_TIMEOUT = 150  # 一键生成：材料多、输出长
 
 
 # 配置 Gemini API
@@ -160,7 +161,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 CARD_VERSION = 3
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
@@ -1353,8 +1354,22 @@ def guide_fingerprint(question_text, answer_text, rubric_text, max_score):
     return rubric_fingerprint(q + "\n##Q##\n" + str(answer_text or ""), rubric_text, max_score)
 
 
+def points_text_card(answer_text, rubric_text, question_num, max_score):
+    """v1.13 给分点格式 → 评分卡。返回 (card 或 None, issues)。"""
+    card, issues, _ai = gc.card_from_points_text(rubric_text, max_score)
+    if issues:
+        return None, issues
+    card["version"] = CARD_VERSION
+    card["question_num"] = str(question_num or "")
+    card["fingerprint"] = rubric_fingerprint(answer_text, rubric_text, max_score)
+    card["updated"] = datetime.now().isoformat(timespec="seconds")
+    return card, []
+
+
 def build_rubric_card(answer_text, rubric_text, question_num, max_score):
     """把评分标准整理成 v2 评分卡：小问 → 多套解法 → 采分点。"""
+    if gc.is_points_text(rubric_text):
+        return points_text_card(answer_text, rubric_text, question_num, max_score)[0]
     points, source, rules = resolve_rubric_points(rubric_text, answer_text, max_score)
     if not points:
         return None
@@ -1744,7 +1759,7 @@ class SimpleGradingUI:
         self._last_grade_start = None
         self.rubric_card = None     # 已确认的结构化评分卡
         self.saved_question_text = ''   # 原题文字（v1.12）
-        self.question_img_path = ''     # 原题截图文件
+        self.material_imgs = []         # 材料箱截图文件（v1.13）
         self.grading_guide = ''         # 老师确认过的批改指南
         self.guide_fp = ''              # 指南对应的 原题+答案+给分点+满分 指纹
         self.is_grading = False
@@ -1963,33 +1978,40 @@ class SimpleGradingUI:
         head_btn(head, "截图识别", self.capture_standard_answer, True)
         self.answer_text = text_box(inner)
 
-        head, inner = panel(1, "给分点", T['orange'], "每行：要点｜分值")
+        head, inner = panel(1, "给分点", T['orange'], "就是评分卡，可直接改")
         head_btn(head, "清空", lambda: (self.rubric_text.delete('1.0', tk.END), self._editor_changed()), False)
-        head_btn(head, "评分卡", self.open_rubric_card, False)
-        head_btn(head, "从答案提取", self.extract_rubric_from_answer, True)
+        head_btn(head, "从答案提取", self.extract_rubric_from_answer, False)
         self.rubric_text = text_box(inner)
         self.rubric_status = tk.Label(inner, text="", font=(F, 10, 'bold'), bg=T['card'], anchor='w', pady=6)
         self.rubric_status.pack(fill=tk.X)
-        tk.Label(inner, text="每步增量分：求出斜率 k=2｜2分；累计分（1分、3分、4分…）会自动换算\n"
-                             "不填也行：优先从参考答案里的评分标准取，再自动拆",
+        tk.Label(inner, text="格式：（1）满分 6 分 → 解法一：名称 → 要点｜分值（每步一行）\n"
+                             "用「材料箱 → 一键生成」会自动写好；旧写法“要点｜分值”也能用",
                  font=(F, 8), bg=T['card'], fg=T['sub'], justify=tk.LEFT, anchor='w').pack(fill=tk.X)
 
-        # v1.12：原题 + 批改指南（备课时生成一次，老师确认后批改才用）
-        head, inner = panel(0, "原题", T['primary'], "截图后自动转成统一格式", row=1)
-        head_btn(head, "清空", self.clear_question, False)
-        head_btn(head, "截原题", self.capture_question, True)
-        self.question_text = text_box(inner)
-        self.question_text.configure(height=5)
+        # v1.13：材料箱（原题、官方答案、手写解法…一起丢进来）+ 批改指南
+        head, inner = panel(0, "材料箱", T['primary'], "原题/答案/手写解法都放这里", row=1)
+        head_btn(head, "清空", self.clear_materials, False)
+        head_btn(head, "粘贴图", self.paste_material_image, False)
+        head_btn(head, "截图添加", self.capture_material, True)
+        self.material_label = tk.Label(inner, text="", font=(F, 9, 'bold'), bg=T['card'], fg=T['primary'],
+                                       anchor='w')
+        self.material_label.pack(fill=tk.X)
+        self.material_text = text_box(inner)
+        self.material_text.configure(height=4)
+        tk.Label(inner, text="上面可以直接粘贴文字材料；截图可以加好几张（原题、答案、你手写的其他解法）",
+                 font=(F, 8), bg=T['card'], fg=T['sub'], anchor='w').pack(fill=tk.X)
 
-        head, inner = panel(1, "批改指南", T['orange'], "原题+答案 → AI 生成，你确认", row=1)
+        head, inner = panel(1, "批改指南", T['orange'], "AI 生成，你确认", row=1)
         head_btn(head, "清空", self.clear_guide, False)
-        head_btn(head, "生成指南", self.generate_guide, True)
+        head_btn(head, "一键生成", self.generate_from_materials, True)
         self.guide_text = text_box(inner)
         self.guide_text.configure(height=5)
         self.guide_status = tk.Label(inner, text="", font=(F, 9, 'bold'), bg=T['card'], anchor='w', pady=4)
         self.guide_status.pack(fill=tk.X)
 
-        for w in (self.answer_text, self.rubric_text, self.question_text):
+        self.material_text.bind('<KeyRelease>', lambda e: self.save_question_data())
+        self._refresh_material_label()
+        for w in (self.answer_text, self.rubric_text):
             w.bind('<KeyRelease>', lambda e: self._editor_changed())
             w.bind('<FocusOut>', lambda e: self._editor_changed())
         # 老师手改指南内容不算过期（老师就是标准）；只保存
@@ -2042,8 +2064,7 @@ class SimpleGradingUI:
 
     # ---------- 原题 / 批改指南（v1.12） ----------
     def _question_now(self):
-        return self.question_text.get('1.0', tk.END).strip() if hasattr(self, 'question_text') else \
-            (self.saved_question_text or '')
+        return (self.saved_question_text or '').strip()
 
     def _guide_now(self):
         return self.guide_text.get('1.0', tk.END).strip() if hasattr(self, 'guide_text') else \
@@ -2062,7 +2083,7 @@ class SimpleGradingUI:
             return 'none', "未生成：批改时不用指南"
         if self.guide_fp and self.guide_fp == self._current_guide_fp():
             return 'ok', "✓ 已确认，批改时会一起发给模型"
-        return 'stale', "✗ 原题/答案/给分点/满分改过，指南已过期，批改时不用；请重新生成"
+        return 'stale', "✗ 答案/给分点/满分改过，指南已过期，批改时不用；请重新生成"
 
     def _guide_edited(self):
         self.grading_guide = self._guide_now()
@@ -2071,26 +2092,37 @@ class SimpleGradingUI:
         self.save_question_data()
         self.refresh_answer_summary()
 
-    def clear_question(self):
-        self.question_text.delete('1.0', tk.END)
-        self.question_img_path = ''
-        self._editor_changed()
-
     def clear_guide(self):
         self.guide_text.delete('1.0', tk.END)
         self.grading_guide = ''
         self.guide_fp = ''
+        self.saved_question_text = ''
         self._editor_changed()
 
-    def _question_img_file(self):
+    # ---------- 材料箱（v1.13） ----------
+    def _material_dir(self):
         app_dir = os.path.dirname(os.path.abspath(__file__))
         qnum = re.sub(r'[^0-9A-Za-z_-]', '_', self.question_num_entry.get().strip() or "x")
-        folder = os.path.join(app_dir, "question_images")
+        folder = os.path.join(app_dir, "materials", f"q{qnum}")
         os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, f"q{qnum}.png")
+        return folder
 
-    def capture_question(self):
-        """截原题：保存截图（生成指南要用），并转写成统一格式的文字。"""
+    def _refresh_material_label(self):
+        if not hasattr(self, 'material_label'):
+            return
+        self.material_imgs = [p for p in (self.material_imgs or []) if os.path.isfile(p)]
+        n = len(self.material_imgs)
+        self.material_label.config(text=f"🖼 已添加 {n} 张截图" if n else "还没有截图（可以只粘贴文字）")
+
+    def _add_material_image(self, img):
+        path = os.path.join(self._material_dir(), datetime.now().strftime("%H%M%S_%f") + ".png")
+        img.convert("RGB").save(path)
+        self.material_imgs = list(self.material_imgs or []) + [path]
+        self._refresh_material_label()
+        self.save_question_data()
+        self.log(f"✓ 材料箱 +1 张截图（共 {len(self.material_imgs)} 张）")
+
+    def capture_material(self):
         editor_open = self.editor.winfo_viewable()
         self.editor.withdraw()
         self.root.iconify()
@@ -2101,152 +2133,209 @@ class SimpleGradingUI:
             img = pyautogui.screenshot(region=(x, y, w, h))
             self.root.deiconify()
             self.open_answer_editor() if editor_open else None
-            try:
-                path = self._question_img_file()
-                img.save(path)
-                self.question_img_path = path
-            except Exception as e:
-                self.log(f"⚠ 原题截图保存失败：{e}")
-            self.log("正在识别原题...")
-
-            def worker():
-                try:
-                    text = self.call_ai_api(gc.capture_prompt("question"), img, need_json=False,
-                                            timeout=PREP_TIMEOUT).strip()
-
-                    def fill():
-                        self.question_text.delete('1.0', tk.END)
-                        self.question_text.insert('1.0', text)
-                        self._editor_changed()
-                        self.log("✓ 原题已识别（请核对一遍）")
-                    self.ui(fill)
-                except Exception as e:
-                    err = str(e)
-                    self.log(f"⚠ 原题识别失败: {err}")
-                    self.ui(lambda: messagebox.showerror("错误", f"原题识别失败：{err}"))
-            threading.Thread(target=worker, daemon=True).start()
+            self._add_material_image(img)
 
         selector = ScreenshotSelector(on_captured)
         selector.start()
 
-    def generate_guide(self):
-        """原题截图 + 参考答案 + 给分点 → 一次调用 → 统一格式的参考答案 + 批改指南，先预览再确认。"""
-        answer = self.answer_text.get('1.0', tk.END).strip()
-        rubric = self.rubric_text.get('1.0', tk.END).strip()
-        question = self._question_now()
-        mx = self._current_max_score()
-        if not answer:
-            messagebox.showinfo("生成指南", "请先填参考答案。", parent=self.editor)
+    def paste_material_image(self):
+        """把剪贴板里的图片（QQ/微信截图、复制的图片）加进材料箱。"""
+        try:
+            from PIL import ImageGrab
+            data = ImageGrab.grabclipboard()
+        except Exception as e:
+            data = None
+            self.log(f"⚠ 读剪贴板失败：{e}")
+        imgs = []
+        if isinstance(data, Image.Image):
+            imgs = [data]
+        elif isinstance(data, list):   # 复制的是图片文件
+            for path in data:
+                try:
+                    imgs.append(Image.open(path))
+                except Exception:
+                    pass
+        if not imgs:
+            messagebox.showinfo("粘贴图", "剪贴板里没有图片。文字请直接粘贴到材料箱的文字框里。", parent=self.editor)
             return
-        if not mx:
-            messagebox.showinfo("生成指南", "请先在主窗口填满分。", parent=self.editor)
-            return
-        img = None
-        if self.question_img_path and os.path.isfile(self.question_img_path):
+        for img in imgs:
+            self._add_material_image(img)
+
+    def clear_materials(self):
+        self.material_imgs = []
+        self.material_text.delete('1.0', tk.END)
+        self._refresh_material_label()
+        self.save_question_data()
+
+    def _stitch_materials(self):
+        """几张截图上下拼成一张（中间加分隔线），这样所有模型都只需要一次请求。"""
+        imgs = []
+        for path in self.material_imgs or []:
             try:
-                img = Image.open(self.question_img_path).convert("RGB")
+                im = Image.open(path).convert("RGB")
             except Exception:
-                img = None
-        if img is None:
-            messagebox.showinfo("生成指南", "请先点「截原题」截一张原题（模型要看着题目写指南）。",
-                                parent=self.editor)
+                continue
+            if im.width > 1100:
+                k = 1100 / im.width
+                im = im.resize((1100, max(1, int(im.height * k))), Image.Resampling.LANCZOS)
+            imgs.append(im)
+        if not imgs:
+            return None
+        width = max(im.width for im in imgs)
+        gap = 14
+        height = sum(im.height for im in imgs) + gap * (len(imgs) - 1)
+        out = Image.new("RGB", (width, height), "white")
+        y = 0
+        for k, im in enumerate(imgs):
+            out.paste(im, (0, y))
+            y += im.height
+            if k < len(imgs) - 1:
+                out.paste(Image.new("RGB", (width, 4), (120, 120, 120)), (0, y + 5))
+                y += gap
+        return out
+
+    def generate_from_materials(self):
+        """材料箱 + 现有参考答案/给分点 → 一次调用 → 原题、统一格式答案、给分点、批改指南 → 预览确认。"""
+        mx = self._current_max_score()
+        if not mx:
+            messagebox.showinfo("一键生成", "请先在主窗口填满分。", parent=self.editor)
             return
+        img = self._stitch_materials()
+        texts = []
+        mat = self.material_text.get('1.0', tk.END).strip()
+        if mat:
+            texts.append(mat)
+        old_answer = self.answer_text.get('1.0', tk.END).strip()
+        old_rubric = self.rubric_text.get('1.0', tk.END).strip()
+        if old_answer:
+            texts.append("【编辑窗口里已有的参考答案】\n" + old_answer)
+        if old_rubric:
+            texts.append("【编辑窗口里已有的给分点】\n" + old_rubric)
+        if img is None and not texts:
+            messagebox.showinfo("一键生成", "材料箱是空的：请截图添加原题和答案，或粘贴文字。", parent=self.editor)
+            return
+        n_images = len(self.material_imgs or []) if img is not None else 0
+        if img is None:   # 只有文字：给一张白图占位，保证各家接口都能用同一种调用
+            img = Image.new("RGB", (64, 64), "white")
         qnum = self.question_num_entry.get().strip()
-        prompt = gc.build_guide_prompt(qnum, mx, question, answer, rubric)
-        self.log("正在生成批改指南（只做一次，约 20–60 秒）...")
+        prompt = gc.build_materials_prompt(qnum, mx, "\n\n".join(texts), n_images)
+        self.log(f"正在一键生成（{n_images} 张截图，只做一次，约 30–90 秒）...")
         self.guide_status.config(text="⏳ 生成中…", fg=self.THEME['sub'])
 
         def worker():
             try:
                 t0 = time.time()
-                text = self.call_ai_api(prompt, img, need_json=False, timeout=PREP_TIMEOUT)
-                new_answer, guide = gc.parse_guide_output(text)
-                self.log(f"✓ 指南已生成（{time.time() - t0:.0f}s），请在预览里确认")
-                self.ui(lambda: self._guide_preview(answer, rubric, new_answer, guide, mx))
+                text = self.call_ai_api(prompt, img, need_json=False, timeout=PREP_LONG_TIMEOUT, prep=True)
+                sec = gc.parse_sections(text)
+                self.log(f"✓ 已生成（{time.time() - t0:.0f}s），请在预览里确认")
+                self.ui(lambda: self._materials_preview(old_answer, sec, mx))
             except Exception as e:
                 err = str(e)
-                self.log(f"⚠ 生成指南失败: {err}")
-                self.ui(lambda: (messagebox.showerror("错误", f"生成指南失败：{err}", parent=self.editor),
+                self.log(f"⚠ 一键生成失败: {err}")
+                self.ui(lambda: (messagebox.showerror("错误", f"一键生成失败：{err}", parent=self.editor),
                                  self.refresh_answer_summary()))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _guide_preview(self, old_answer, rubric, new_answer, guide, mx):
-        """预览：左边整理后的参考答案，右边批改指南。老师确认后才生效。"""
+    def _materials_preview(self, old_answer, sec, mx):
+        """预览四部分：原题 / 参考答案 / 给分点 / 批改指南。都能改，确认后才生效。"""
         T, F = self.THEME, self.FONT
-        if not guide and not new_answer:
-            messagebox.showerror("生成指南", "模型没有按格式返回内容，请再点一次「生成指南」。", parent=self.editor)
+        if not (sec.get("给分点") or sec.get("参考答案")):
+            messagebox.showerror("一键生成", "模型没有按格式返回内容，请再点一次「一键生成」。", parent=self.editor)
             self.refresh_answer_summary()
             return
-        same, msg = gc.check_scores_kept(old_answer, new_answer) if new_answer else (False, "模型没有返回整理后的答案")
-        extra = gc.guide_new_scores(guide, [old_answer, rubric], mx)
-
         win = tk.Toplevel(self.editor)
-        win.title("确认：统一格式的参考答案 + 批改指南")
+        win.title("确认：原题 · 参考答案 · 给分点 · 批改指南")
         win.configure(bg=T['bg'])
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        win.geometry(f"{min(1150, int(sw * 0.8))}x{min(820, int(sh * 0.85))}")
+        win.geometry(f"{min(1250, int(sw * 0.85))}x{min(880, int(sh * 0.9))}")
         win.transient(self.editor)
         win.attributes('-topmost', True)
 
-        top = tk.Frame(win, bg=T['bg'], padx=12, pady=8)
+        top = tk.Frame(win, bg=T['bg'], padx=12, pady=6)
         top.pack(fill=tk.X)
-        tk.Label(top, text=("✓ " if same else "✗ ") + msg, font=(F, 10, 'bold'), bg=T['bg'],
-                 fg=T['ok'] if same else T['danger'], anchor='w').pack(fill=tk.X)
-        if not same:
-            tk.Label(top, text="分值对不上时默认不替换参考答案，只用指南；你核对后也可以勾选替换。",
-                     font=(F, 9), bg=T['bg'], fg=T['sub'], anchor='w').pack(fill=tk.X)
-        if extra:
-            tk.Label(top, text="⚠ 指南里出现了标准里没有的分值："
-                     + "、".join(f"{fmt_score(x)}分" for x in extra) + "，请删掉或改正",
-                     font=(F, 9, 'bold'), bg=T['bg'], fg=T['danger'], anchor='w').pack(fill=tk.X)
+        status = tk.Label(top, text="", font=(F, 10, 'bold'), bg=T['bg'], anchor='w', justify=tk.LEFT)
+        status.pack(fill=tk.X)
 
         mid = tk.Frame(win, bg=T['bg'], padx=12)
         mid.pack(fill=tk.BOTH, expand=True)
-        mid.grid_columnconfigure(0, weight=1, uniform='pv')
-        mid.grid_columnconfigure(1, weight=1, uniform='pv')
+        for c in (0, 1):
+            mid.grid_columnconfigure(c, weight=1, uniform='pv')
         mid.grid_rowconfigure(1, weight=1)
-        boxes = []
-        for col, (title, content) in enumerate((("整理后的参考答案（可改）", new_answer),
-                                                ("批改指南（可改）", guide))):
-            tk.Label(mid, text=title, font=(F, 10, 'bold'), bg=T['bg'], fg=T['teal_d'] if col == 0 else T['orange'],
-                     anchor='w').grid(row=0, column=col, sticky='w', padx=(0, 8) if col == 0 else 0)
+        mid.grid_rowconfigure(3, weight=2)
+        boxes = {}
+        layout = (("原题", 0, 0, T['primary']), ("给分点", 0, 1, T['orange']),
+                  ("参考答案", 2, 0, T['teal_d']), ("批改指南", 2, 1, T['orange']))
+        for name, row, col, color in layout:
+            tk.Label(mid, text=name + "（可改）", font=(F, 10, 'bold'), bg=T['bg'], fg=color,
+                     anchor='w').grid(row=row, column=col, sticky='w', pady=(6, 0))
             box = scrolledtext.ScrolledText(mid, font=(F, 11), wrap=tk.WORD, relief=tk.FLAT, bg=T['input'],
                                             fg=T['text'], highlightthickness=1, highlightbackground=T['line'],
-                                            padx=8, pady=6, undo=True)
-            box.grid(row=1, column=col, sticky='nsew', padx=(0, 8) if col == 0 else 0)
-            box.insert('1.0', content or "")
-            boxes.append(box)
+                                            padx=8, pady=6, undo=True, height=6)
+            box.grid(row=row + 1, column=col, sticky='nsew', padx=(0, 8) if col == 0 else 0)
+            box.insert('1.0', sec.get(name) or "")
+            boxes[name] = box
 
-        bottom = tk.Frame(win, bg=T['bg'], padx=12, pady=10)
-        bottom.pack(fill=tk.X)
-        replace_var = tk.BooleanVar(value=bool(same and new_answer))
-        tk.Checkbutton(bottom, text="用整理后的答案替换原参考答案（替换后在答案框里按 Ctrl+Z 可撤销）",
-                       variable=replace_var, bg=T['bg'], font=(F, 9),
-                       state=tk.NORMAL if new_answer else tk.DISABLED).pack(side=tk.LEFT)
+        def check():
+            points = boxes["给分点"].get('1.0', tk.END).strip()
+            answer = boxes["参考答案"].get('1.0', tk.END).strip()
+            guide = boxes["批改指南"].get('1.0', tk.END).strip()
+            _card, issues, ai_lines = gc.card_from_points_text(points, mx)
+            msgs, bad = [], bool(issues)
+            if issues:
+                msgs += ["✗ " + x for x in issues[:4]]
+            else:
+                n_m = sum(len(p["methods"]) for p in _card["parts"])
+                msgs.append(f"✓ 给分点格式正确：{len(_card['parts'])} 问，{n_m} 套解法，每套合计都等于满分")
+            if ai_lines:
+                msgs.append(f"⚠ 有 {len(ai_lines)} 条分值是 AI 拟的（行尾“{gc.AI_MARK}”），请逐条核对")
+            if old_answer:
+                from collections import Counter
+                lost = Counter(gc.score_numbers(old_answer)) - Counter(gc.score_numbers(answer))
+                if lost:
+                    msgs.append("⚠ 原参考答案里的分值在新答案里找不到："
+                                + "、".join(f"{fmt_score(x)}分" for x in lost.elements()))
+            extra = gc.guide_new_scores(guide, [points, answer], mx)
+            if extra:
+                msgs.append("⚠ 指南里出现了给分点以外的分值：" + "、".join(f"{fmt_score(x)}分" for x in extra))
+            status.config(text="\n".join(msgs), fg=T['danger'] if bad else (T['text'] if len(msgs) > 1 else T['ok']))
+            return issues, ai_lines
 
         def confirm():
-            final_answer = boxes[0].get('1.0', tk.END).strip()
-            final_guide = boxes[1].get('1.0', tk.END).strip()
-            if replace_var.get() and final_answer:
-                ok, why = gc.check_scores_kept(old_answer, final_answer)
-                if not ok and not messagebox.askyesno(
-                        "分值核对", why + "\n\n仍然替换参考答案吗？", parent=win):
-                    return
-                self.answer_text.edit_separator()
-                self.answer_text.delete('1.0', tk.END)
-                self.answer_text.insert('1.0', final_answer)
-                self.answer_text.edit_separator()
+            issues, ai_lines = check()
+            if issues:
+                messagebox.showerror("给分点", "给分点还有问题，请先在预览里改好：\n\n" + "\n".join(issues[:6]),
+                                     parent=win)
+                return
+            if ai_lines and not messagebox.askyesno(
+                    "AI 拟的分值", f"有 {len(ai_lines)} 条分值是 AI 拟的：\n\n" + "\n".join(ai_lines[:8])
+                    + "\n\n你都核对过了吗？确认后去掉“AI拟分”标记，按这些分值批改。", parent=win):
+                return
+            points = gc.strip_ai_marks(boxes["给分点"].get('1.0', tk.END).strip())
+            for widget, name in ((self.answer_text, "参考答案"), (self.rubric_text, None)):
+                value = points if name is None else boxes[name].get('1.0', tk.END).strip()
+                widget.edit_separator()
+                widget.delete('1.0', tk.END)
+                widget.insert('1.0', value)
+                widget.edit_separator()
+            self.saved_question_text = boxes["原题"].get('1.0', tk.END).strip()
+            guide = boxes["批改指南"].get('1.0', tk.END).strip()
             self.guide_text.delete('1.0', tk.END)
-            self.guide_text.insert('1.0', final_guide)
-            self.grading_guide = final_guide
-            self.guide_fp = self._current_guide_fp() if final_guide else ''
+            self.guide_text.insert('1.0', guide)
+            self.grading_guide = guide
+            self.guide_fp = self._current_guide_fp() if guide else ''
+            self.rubric_card = None
             self._card_logged = None
             self.save_config()
             self.refresh_answer_summary()
-            self.log("✓ 批改指南已确认" + ("，参考答案已换成统一格式" if replace_var.get() else ""))
+            self.log("✓ 已确认：参考答案、给分点、批改指南已更新（答案框/给分点框里按 Ctrl+Z 可撤销）")
             win.destroy()
 
-        for text, cmd, solid in (("取消", win.destroy, False), ("确认使用", confirm, True)):
+        bottom = tk.Frame(win, bg=T['bg'], padx=12, pady=10)
+        bottom.pack(fill=tk.X)
+        tk.Label(bottom, text="确认后会替换编辑窗口里的参考答案和给分点", font=(F, 9), bg=T['bg'],
+                 fg=T['sub']).pack(side=tk.LEFT)
+        for text, cmd, solid in (("取消", win.destroy, False), ("确认使用", confirm, True),
+                                 ("重新检查", check, False)):
             slot = tk.Frame(bottom, bg=T['bg'], width=100, height=30)
             slot.pack_propagate(False)
             slot.pack(side=tk.RIGHT, padx=(8, 0))
@@ -2255,6 +2344,7 @@ class SimpleGradingUI:
             else:
                 b = self._btn(slot, text, cmd, T['teal_bg'], fg=T['teal_d'], active='#C3FAE8')
             b.pack(fill=tk.BOTH, expand=True)
+        check()
         self.refresh_answer_summary()
 
     def active_guide(self):
@@ -2275,571 +2365,6 @@ class SimpleGradingUI:
         except ValueError:
             return 0.0
 
-    def open_rubric_card(self):
-        T, F = self.THEME, self.FONT
-        win = getattr(self, 'card_win', None)
-        if win and win.winfo_exists():
-            win.deiconify(); win.lift(); win.focus_force()
-            self._card_load_working(); self._card_render()
-            return
-        win = tk.Toplevel(self.root)
-        self.card_win = win
-        win.title("评分卡 · 确认后按此判分")
-        win.geometry("960x760")
-        win.transient(self.root)
-        win.configure(bg=T['bg'])
-        win.protocol("WM_DELETE_WINDOW", win.withdraw)
-        win.bind('<Escape>', lambda e: win.withdraw())
-
-        top = tk.Frame(win, bg=T['orange'], height=44)
-        top.pack(fill=tk.X); top.pack_propagate(False)
-        tk.Label(top, text="评分卡", font=(F, 13, 'bold'), bg=T['orange'], fg='white').pack(side=tk.LEFT, padx=14)
-        self.card_title = tk.Label(top, text="", font=(F, 10), bg=T['orange'], fg='#FFE8DE')
-        self.card_title.pack(side=tk.LEFT)
-        slot = tk.Frame(top, bg=T['orange'], width=112, height=28)
-        slot.pack_propagate(False); slot.pack(side=tk.RIGHT, padx=10, pady=8)
-        self._btn(slot, "保存并应用", self._card_save, 'white', fg=T['primary_d'],
-                  active=T['tint'], bold=True).pack(fill=tk.BOTH, expand=True)
-
-        bar = tk.Frame(win, bg=T['card'], padx=10, pady=8)
-        bar.pack(fill=tk.X)
-
-        def tb(text, cmd, primary=False):
-            b = tk.Button(bar, text=text, command=cmd, font=(F, 9, 'bold' if primary else 'normal'),
-                          bg=T['orange'] if primary else T['bg'], fg='white' if primary else T['text'],
-                          activebackground=T['primary_d'] if primary else T['line'],
-                          relief=tk.FLAT, padx=10, pady=4, cursor='hand2')
-            b.pack(side=tk.LEFT, padx=(0, 6))
-            return b
-
-        tb("从标准生成", self._card_generate, True)
-        tb("新增得分点", self._card_add)
-        tb("新增解法", self._card_add_method)
-        tb("编辑", self._card_edit)
-        tb("删除", self._card_delete)
-        tb("上移", lambda: self._card_move(-1))
-        tb("下移", lambda: self._card_move(1))
-
-        body = tk.Frame(win, bg=T['bg'], padx=10)
-        body.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        tree = ttk.Treeview(body, columns=("id", "text", "full", "eq"), show="headings", height=20)
-        for c, txt, w, anchor in (("id", "#", 85, 'center'), ("text", "小问 / 解法 / 得分点", 520, 'w'),
-                                  ("full", "分值", 60, 'center'), ("eq", "备注 / 等价写法", 230, 'w')):
-            tree.heading(c, text=txt)
-            tree.column(c, width=w, anchor=anchor)
-        vs = ttk.Scrollbar(body, orient='vertical', command=tree.yview)
-        tree.configure(yscrollcommand=vs.set)
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vs.pack(side=tk.RIGHT, fill=tk.Y)
-        tree.bind('<Double-1>', lambda e: self._card_edit())
-        self.card_tree = tree
-
-        self.card_status = tk.Label(win, text="", font=(F, 10, 'bold'), bg=T['bg'], anchor='w', padx=12)
-        self.card_status.pack(fill=tk.X)
-        tk.Label(win, text="每个小问可有多套解法；每套解法的分值合计必须等于该小问满分。双击得分点编辑，双击解法改名。",
-                 font=(F, 8), bg=T['bg'], fg=T['sub'], anchor='w', padx=12).pack(fill=tk.X, pady=(2, 8))
-
-        self._card_load_working()
-        self._card_render()
-        win.lift(); win.focus_force()
-
-    def _card_load_working(self):
-        ans = self.answer_text.get('1.0', tk.END).strip()
-        rubric = self.rubric_text.get('1.0', tk.END).strip()
-        mx = self._current_max_score()
-        card = getattr(self, 'rubric_card', None)
-        if card and card_is_fresh(card, ans, rubric, mx):
-            card = upgrade_rubric_card(card, mx)
-            if not validate_rubric_card(card, mx):
-                self.card_parts = copy.deepcopy(card.get('parts') or [])
-                self._card_load_rules(card)
-                return
-        fresh = build_rubric_card(ans, rubric, self.question_num_entry.get().strip(), mx)
-        self.card_parts = copy.deepcopy(fresh.get('parts') or []) if fresh else []
-        self._card_load_rules(fresh or {})
-
-    def _card_load_rules(self, card):
-        self.card_rules = list(card.get('rules') or [])
-        self.card_cumulative = bool(card.get('cumulative'))
-        self.card_cumulative_raw = list(card.get('cumulative_raw') or [])
-        self.card_aliases = dict(card.get('aliases') or {})
-        self.card_source = card.get('source') or 'card'
-        self.card_score_cap = card.get('score_cap')
-        self.card_cap_text = card.get('cap_text', '')
-        self.card_zero_rules = list(card.get('zero_rules') or [])
-        self.card_deduction_rules = list(card.get('deduction_rules') or [])
-
-    def _card_render(self):
-        tree = getattr(self, 'card_tree', None)
-        if not tree:
-            return
-        selected = tree.selection()
-        tree.delete(*tree.get_children())
-        try:
-            tree.tag_configure('part', background='#FFF1E6', font=(self.FONT, 9, 'bold'))
-            tree.tag_configure('method', background='#F4F7FB', font=(self.FONT, 9, 'bold'))
-        except Exception:
-            pass
-        for part in self.card_parts:
-            part_id = str(part.get('id'))
-            part_iid = f"part:{part_id}"
-            tree.insert('', tk.END, iid=part_iid, open=True, tags=('part',), values=(
-                '', f"第{part_id}小问  {part.get('title', '')}",
-                fmt_score(part.get('max_score', 0)), ''))
-            for method in part.get('methods') or []:
-                method_id = str(method.get('id'))
-                method_iid = f"method:{part_id}:{method_id}"
-                method_total = sum(float(p.get('full', 0) or 0)
-                                   for p in (method.get('points') or []))
-                tree.insert(part_iid, tk.END, iid=method_iid, open=True, tags=('method',), values=(
-                    method_id, f"解法：{method.get('name', '')}",
-                    fmt_score(method_total), method.get('notes', '')))
-                for point in method.get('points') or []:
-                    point_id = str(point.get('id'))
-                    if point.get('result_only'):
-                        point_tag = "【结果】"
-                    elif point.get('shared'):
-                        point_tag = "【共用】"
-                    else:
-                        point_tag = ""
-                    point_text = point_tag + point.get('text', '')
-                    tree.insert(method_iid, tk.END,
-                                iid=f"point:{part_id}:{method_id}:{point_id}",
-                                values=(point_id, point_text,
-                                        fmt_score(point.get('full', 0)),
-                                        '、'.join(point.get('equivalents') or [])))
-        for iid in selected:
-            if tree.exists(iid):
-                tree.selection_set(iid)
-                break
-        mx = self._current_max_score()
-        parts = len(self.card_parts)
-        methods = sum(len(p.get('methods') or []) for p in self.card_parts)
-        points = sum(len(m.get('points') or []) for p in self.card_parts
-                     for m in (p.get('methods') or []))
-        default_total = sum(float(p.get('full', 0) or 0) for p in self._card_default_points())
-        bad = []
-        for part in self.card_parts:
-            part_max = float(part.get('max_score', 0) or 0)
-            for method in part.get('methods') or []:
-                method_total = sum(float(p.get('full', 0) or 0)
-                                   for p in (method.get('points') or []))
-                if abs(method_total - part_max) > 0.01:
-                    bad.append(f"{method.get('id')}={fmt_score(method_total)}/{fmt_score(part_max)}")
-        ok = bool(mx) and abs(default_total - mx) < 0.01 and not bad
-        txt = (f"{parts} 小问 · {methods} 套解法 · {points} 个得分点 · "
-               f"默认合计 {fmt_score(default_total)}/{fmt_score(mx)} 分")
-        if bad:
-            txt += "  ✗ " + "、".join(bad[:4])
-        else:
-            txt += "  ✓ 可用" if ok else "  ✗ 与满分不一致"
-        if self.card_cumulative:
-            txt += " · 累计分已换算"
-        self.card_status.config(text=txt, fg=self.THEME['ok'] if ok else self.THEME['danger'])
-        self.card_title.config(text=f"第 {self.question_num_entry.get().strip() or '?'} 题")
-
-    def _card_selected(self):
-        tree = getattr(self, 'card_tree', None)
-        sel = tree.selection() if tree else ()
-        if not sel:
-            return None
-        parts = str(sel[0]).split(':')
-        if parts[0] == 'point' and len(parts) >= 4:
-            return {'kind': 'point', 'part_id': parts[1],
-                    'method_id': parts[2], 'point_id': parts[3]}
-        if parts[0] == 'method' and len(parts) >= 3:
-            return {'kind': 'method', 'part_id': parts[1], 'method_id': parts[2]}
-        if parts[0] == 'part' and len(parts) >= 2:
-            return {'kind': 'part', 'part_id': parts[1]}
-        return None
-
-    def _card_find_part(self, part_id):
-        for part in self.card_parts:
-            if str(part.get('id')) == str(part_id):
-                return part
-        return None
-
-    def _card_find_method(self, part_id, method_id):
-        part = self._card_find_part(part_id)
-        if not part:
-            return None
-        for method in part.get('methods') or []:
-            if str(method.get('id')) == str(method_id):
-                return method
-        return None
-
-    def _card_find_point(self, part_id, method_id, point_id):
-        method = self._card_find_method(part_id, method_id)
-        if not method:
-            return None
-        for point in method.get('points') or []:
-            if str(point.get('id')) == str(point_id):
-                return point
-        return None
-
-    def _card_part_of_method(self, method):
-        for part in self.card_parts:
-            if any(m is method for m in (part.get('methods') or [])):
-                return part
-        return None
-
-    def _card_normalize_ids(self):
-        for i, part in enumerate(self.card_parts, 1):
-            part['id'] = str(i)
-            part['max_score'] = float(part.get('max_score', 0) or 0)
-            methods = part.get('methods') or []
-            for j, method in enumerate(methods):
-                suffix = chr(65 + j) if j < 26 else f"M{j + 1}"
-                method['id'] = f"{part['id']}-{suffix}"
-                for k, point in enumerate(method.get('points') or [], 1):
-                    point['id'] = f"{method['id']}-{k}"
-
-    def _card_default_points(self):
-        points = []
-        for part in self.card_parts:
-            methods = part.get('methods') or []
-            if not methods:
-                continue
-            for point in methods[0].get('points') or []:
-                item = copy.deepcopy(point)
-                item['part_id'] = part.get('id')
-                item['method_id'] = methods[0].get('id')
-                points.append(item)
-        return points
-
-    def _card_generate(self):
-        ans = self.answer_text.get('1.0', tk.END).strip()
-        rubric = self.rubric_text.get('1.0', tk.END).strip()
-        card = build_rubric_card(ans, rubric, self.question_num_entry.get().strip(),
-                                 self._current_max_score())
-        if not card:
-            messagebox.showwarning("评分卡", "当前参考答案/给分点里没有可识别的得分点。\n"
-                                             "请写成「1分：……」「要求（2分）」或「要求｜2分」。",
-                                   parent=self.card_win)
-            return
-        self.card_parts = copy.deepcopy(card.get('parts') or [])
-        self._card_load_rules(card)
-        self._card_normalize_ids()
-        self._card_render()
-        methods = sum(len(p.get('methods') or []) for p in self.card_parts)
-        self.log(f"评分卡：{len(self.card_parts)} 个小问，{methods} 套解法")
-
-    def _card_add(self):
-        selected = self._card_selected()
-        method = None
-        if selected and selected.get('kind') in ('point', 'method'):
-            method = self._card_find_method(selected['part_id'], selected['method_id'])
-        if method is None:
-            for part in self.card_parts:
-                methods = part.get('methods') or []
-                if methods:
-                    method = methods[0]
-                    break
-        if method is None:
-            messagebox.showinfo("评分卡", "先点「从标准生成」建立评分卡。", parent=self.card_win)
-            return
-
-        def apply(point):
-            method.setdefault('points', []).append(point)
-            self._card_normalize_ids()
-            self._card_render()
-            part = self._card_part_of_method(method)
-            if part and method.get('points'):
-                self.card_tree.selection_set(
-                    f"point:{part['id']}:{method['id']}:{method['points'][-1]['id']}")
-
-        self._card_edit_dialog(None, apply)
-
-    def _card_add_method(self):
-        selected = self._card_selected()
-        part = None
-        source = None
-        if selected:
-            part = self._card_find_part(selected['part_id'])
-            if selected.get('kind') in ('method', 'point'):
-                source = self._card_find_method(selected['part_id'], selected['method_id'])
-        if part is None and self.card_parts:
-            part = self.card_parts[0]
-        if part is None:
-            messagebox.showinfo("评分卡", "先点「从标准生成」建立评分卡。", parent=self.card_win)
-            return
-        source = source or (part.get('methods') or [None])[0]
-        if not source:
-            return
-        new_method = copy.deepcopy(source)
-        new_method['id'] = ''
-        new_method['name'] = f"解法{len(part.get('methods') or []) + 1}"
-        new_method['notes'] = "请修改为本套解法的必需要素；合计必须等于小问满分"
-        for point in new_method.get('points') or []:
-            point['id'] = ''
-        part.setdefault('methods', []).append(new_method)
-        self._card_normalize_ids()
-        self._card_render()
-        self.card_tree.selection_set(f"method:{part['id']}:{new_method['id']}")
-        messagebox.showinfo(
-            "评分卡",
-            "已复制一套解法。请双击修改解法名称和每个采分点；\n"
-            "这套解法的分值合计必须等于该小问满分，否则不能保存。",
-            parent=self.card_win)
-
-    def _card_edit(self):
-        selected = self._card_selected()
-        if not selected:
-            messagebox.showinfo("评分卡", "先选中一行。", parent=self.card_win)
-            return
-        if selected['kind'] == 'point':
-            point = self._card_find_point(
-                selected['part_id'], selected['method_id'], selected['point_id'])
-            if point is None:
-                return
-
-            def apply(new_point):
-                point.clear()
-                point.update(new_point)
-                self._card_normalize_ids()
-                self._card_render()
-
-            self._card_edit_dialog(point, apply)
-            return
-        if selected['kind'] == 'method':
-            method = self._card_find_method(selected['part_id'], selected['method_id'])
-            if method is None:
-                return
-            name = simpledialog.askstring(
-                "解法名称", "这套解法的名称：", initialvalue=method.get('name', ''),
-                parent=self.card_win)
-            if name is not None and name.strip():
-                method['name'] = name.strip()
-                self._card_render()
-            return
-        part = self._card_find_part(selected['part_id'])
-        if part is None:
-            return
-        title = simpledialog.askstring(
-            "小问标题", "这个小问的标题：", initialvalue=part.get('title', ''),
-            parent=self.card_win)
-        if title is not None and title.strip():
-            part['title'] = title.strip()
-            self._card_render()
-
-    def _card_delete(self):
-        selected = self._card_selected()
-        if not selected:
-            return
-        if selected['kind'] == 'point':
-            method = self._card_find_method(selected['part_id'], selected['method_id'])
-            point = self._card_find_point(
-                selected['part_id'], selected['method_id'], selected['point_id'])
-            if method and point and messagebox.askyesno(
-                    "评分卡", "删除这个得分点？", parent=self.card_win):
-                method['points'].remove(point)
-                self._card_normalize_ids()
-                self._card_render()
-            return
-        if selected['kind'] == 'method':
-            part = self._card_find_part(selected['part_id'])
-            methods = (part.get('methods') or []) if part else []
-            if len(methods) <= 1:
-                messagebox.showinfo("评分卡", "每个小问至少要保留一套解法。", parent=self.card_win)
-                return
-            method = self._card_find_method(selected['part_id'], selected['method_id'])
-            if method and messagebox.askyesno(
-                    "评分卡", f"删除解法「{method.get('name', '')}」及其全部得分点？",
-                    parent=self.card_win):
-                methods.remove(method)
-                self._card_normalize_ids()
-                self._card_render()
-            return
-        messagebox.showinfo("评分卡", "小问不能删除；可以双击修改标题。", parent=self.card_win)
-
-    def _card_move(self, delta):
-        selected = self._card_selected()
-        if not selected:
-            return
-        if selected['kind'] == 'point':
-            method = self._card_find_method(selected['part_id'], selected['method_id'])
-            point = self._card_find_point(
-                selected['part_id'], selected['method_id'], selected['point_id'])
-            points = method.get('points') or [] if method else []
-            if point not in points:
-                return
-            idx = points.index(point)
-            j = idx + delta
-            if 0 <= j < len(points):
-                points[idx], points[j] = points[j], points[idx]
-                self._card_normalize_ids()
-                self._card_render()
-                self.card_tree.selection_set(
-                    f"point:{selected['part_id']}:{method['id']}:{points[j]['id']}")
-            return
-        if selected['kind'] == 'method':
-            part = self._card_find_part(selected['part_id'])
-            methods = (part.get('methods') or []) if part else []
-            method = self._card_find_method(selected['part_id'], selected['method_id'])
-            if method not in methods:
-                return
-            idx = methods.index(method)
-            j = idx + delta
-            if 0 <= j < len(methods):
-                methods[idx], methods[j] = methods[j], methods[idx]
-                self._card_normalize_ids()
-                self._card_render()
-                self.card_tree.selection_set(
-                    f"method:{selected['part_id']}:{methods[j]['id']}")
-            return
-        part = self._card_find_part(selected['part_id'])
-        if part not in self.card_parts:
-            return
-        idx = self.card_parts.index(part)
-        j = idx + delta
-        if 0 <= j < len(self.card_parts):
-            self.card_parts[idx], self.card_parts[j] = self.card_parts[j], self.card_parts[idx]
-            self._card_normalize_ids()
-            self._card_render()
-            self.card_tree.selection_set(f"part:{self.card_parts[j]['id']}")
-
-    def _card_edit_dialog(self, point, on_ok):
-        T, F = self.THEME, self.FONT
-        p = copy.deepcopy(point) if point else {
-            'id': '', 'text': '', 'goal': '', 'full': 1,
-            'required': [], 'equivalents': [], 'notes': '',
-            'deductions': [], 'zero_if': [], 'aliases': {},
-            'shared': False, 'result_only': False,
-            'band': False, 'levels': [],
-        }
-        dlg = tk.Toplevel(self.card_win)
-        dlg.title("编辑得分点")
-        dlg.geometry("620x650")
-        dlg.transient(self.card_win)
-        dlg.grab_set()
-        box = tk.Frame(dlg, padx=14, pady=12)
-        box.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(box, text="得分点要求", font=(F, 9, 'bold'), anchor='w').pack(fill=tk.X)
-        text = tk.Text(box, height=4, font=(F, 10), wrap=tk.WORD, relief=tk.FLAT,
-                       highlightthickness=1, highlightbackground=T['line'])
-        text.pack(fill=tk.X, pady=(2, 8))
-        text.insert('1.0', p.get('text', ''))
-
-        row = tk.Frame(box); row.pack(fill=tk.X, pady=(0, 8))
-        tk.Label(row, text="分值", font=(F, 9, 'bold')).pack(side=tk.LEFT)
-        full_var = tk.StringVar(value=str(fmt_score(p.get('full', 1))))
-        tk.Entry(row, textvariable=full_var, width=8, justify=tk.CENTER, font=(F, 11)).pack(side=tk.LEFT, padx=8)
-        tk.Label(row, text="分值必须和本小问其他得分点配平", font=(F, 9)).pack(side=tk.LEFT, padx=(10, 0))
-
-        tk.Label(box, text="必需要素（每行一个；留空则按上面的目标整体核对）",
-                 font=(F, 9, 'bold'), anchor='w').pack(fill=tk.X)
-        required = tk.Text(box, height=3, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
-                           highlightthickness=1, highlightbackground=T['line'])
-        required.pack(fill=tk.X, pady=(2, 8))
-        required.insert('1.0', "\n".join(p.get('required') or []))
-
-        tk.Label(box, text="等价写法（每行一个，可留空）",
-                 font=(F, 9, 'bold'), anchor='w').pack(fill=tk.X)
-        eq = tk.Text(box, height=3, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
-                     highlightthickness=1, highlightbackground=T['line'])
-        eq.pack(fill=tk.X, pady=(2, 8))
-        eq.insert('1.0', "\n".join(p.get('equivalents') or []))
-
-        tk.Label(box, text="额外说明（可留空）", font=(F, 9, 'bold'), anchor='w').pack(fill=tk.X)
-        note_var = tk.StringVar(value=str(p.get('notes', '') or ''))
-        tk.Entry(box, textvariable=note_var, font=(F, 9), relief=tk.FLAT,
-                 highlightthickness=1, highlightbackground=T['line']).pack(fill=tk.X, pady=(2, 10))
-
-        shared_var = tk.BooleanVar(value=bool(p.get('shared')))
-        tk.Checkbutton(
-            box, text="所有解法共用这个采分点（未覆盖解法时也按此点给分）",
-            variable=shared_var, font=(F, 9), bg=T['bg'], anchor='w'
-        ).pack(fill=tk.X, pady=(0, 8))
-        result_var = tk.BooleanVar(value=bool(p.get('result_only')))
-        tk.Checkbutton(
-            box, text="结果点（只核对最终结论；结果正确即可给分）",
-            variable=result_var, font=(F, 9), bg=T['bg'], anchor='w'
-        ).pack(fill=tk.X, pady=(0, 8))
-
-        btns = tk.Frame(box); btns.pack(fill=tk.X)
-
-        def ok():
-            t = text.get('1.0', tk.END).strip()
-            if not t:
-                messagebox.showwarning("评分卡", "得分点要求不能为空。", parent=dlg)
-                return
-            try:
-                v = float(full_var.get().strip())
-            except ValueError:
-                messagebox.showwarning("评分卡", "分值要填数字。", parent=dlg)
-                return
-            if v <= 0:
-                messagebox.showwarning("评分卡", "分值必须大于 0。", parent=dlg)
-                return
-            required_lines = [x.strip() for x in required.get('1.0', tk.END).splitlines()
-                              if x.strip()]
-            new = copy.deepcopy(p)
-            new.update({
-                'id': p.get('id'),
-                'text': t,
-                'goal': t,
-                'full': v,
-                'required': required_lines or [t],
-                'equivalents': [x.strip() for x in eq.get('1.0', tk.END).splitlines()
-                                if x.strip()],
-                'notes': note_var.get().strip(),
-                'shared': bool(shared_var.get()),
-                'result_only': bool(result_var.get()),
-            })
-            dlg.destroy()
-            on_ok(new)
-
-        tk.Button(btns, text="取消", command=dlg.destroy, font=(F, 9), relief=tk.FLAT,
-                  bg=T['bg'], padx=12, pady=4).pack(side=tk.RIGHT)
-        tk.Button(btns, text="保存", command=ok, font=(F, 9, 'bold'), relief=tk.FLAT,
-                  bg=T['orange'], fg='white', padx=14, pady=4).pack(side=tk.RIGHT, padx=6)
-
-    def _card_save(self):
-        ans = self.answer_text.get('1.0', tk.END).strip()
-        rubric = self.rubric_text.get('1.0', tk.END).strip()
-        mx = self._current_max_score()
-        self._card_normalize_ids()
-        card = {
-            'version': CARD_VERSION,
-            'score_mode': 'bands' if bool(getattr(self, 'card_cumulative', False))
-            else 'points',
-            'question_num': self.question_num_entry.get().strip(),
-            'max_score': mx,
-            'source': getattr(self, 'card_source', 'card'),
-            'cumulative': bool(getattr(self, 'card_cumulative', False)),
-            'cumulative_raw': list(getattr(self, 'card_cumulative_raw', [])),
-            'parts': copy.deepcopy(self.card_parts),
-            'points': self._card_default_points(),
-            'aliases': dict(getattr(self, 'card_aliases', {})),
-            'rules': list(getattr(self, 'card_rules', [])),
-            'score_cap': getattr(self, 'card_score_cap', None),
-            'cap_text': getattr(self, 'card_cap_text', ''),
-            'zero_rules': list(getattr(self, 'card_zero_rules', [])),
-            'deduction_rules': list(getattr(self, 'card_deduction_rules', [])),
-            'fingerprint': rubric_fingerprint(ans, rubric, mx),
-            'updated': datetime.now().isoformat(timespec='seconds'),
-        }
-        issues = validate_rubric_card(card, mx)
-        if issues:
-            messagebox.showwarning("评分卡", "还不能应用：\n\n" + "\n".join(f"• {i}" for i in issues),
-                                   parent=self.card_win)
-            return
-        self.rubric_card = card
-        self.save_config()
-        self.refresh_answer_summary()
-        methods = sum(len(p.get('methods') or []) for p in card['parts'])
-        points = sum(len(m.get('points') or []) for p in card['parts']
-                     for m in (p.get('methods') or []))
-        total = sum(float(p.get('full', 0) or 0) for p in card['points'])
-        self.log(f"✓ 评分卡已启用：{len(card['parts'])} 个小问 / {methods} 套解法 / "
-                 f"{points} 个得分点，默认合计 {fmt_score(total)} 分")
-        messagebox.showinfo(
-            "评分卡",
-            f"已保存并启用：{len(card['parts'])} 个小问、{methods} 套解法。\n"
-            "每套解法都已校验合计等于小问满分。",
-            parent=self.card_win)
-
     def refresh_answer_summary(self):
         if not hasattr(self, 'answer_summary'):
             return
@@ -2851,7 +2376,15 @@ class SimpleGradingUI:
             mx = 0
         rubric_now = self.rubric_text.get('1.0', tk.END)
         card = getattr(self, 'rubric_card', None)
-        if card and card_is_fresh(card, ans, rubric_now, mx or 0) and not validate_rubric_card(card, mx or 0):
+        grammar_issues = []
+        if gc.is_points_text(rubric_now):
+            pcard, grammar_issues, _ai = gc.card_from_points_text(rubric_now, mx or None)
+            card = pcard
+            scored = [(p["text"], float(p["full"])) for p in card_flat_points(pcard)]
+            if grammar_issues:
+                scored = []
+            source, rules = "card", rules_from_card(pcard)
+        elif card and card_is_fresh(card, ans, rubric_now, mx or 0) and not validate_rubric_card(card, mx or 0):
             card = upgrade_rubric_card(card, mx or 0)
             scored = [(p["text"], float(p["full"])) for p in card_flat_points(card)]
             source, rules = "card", rules_from_card(card)
@@ -2871,6 +2404,9 @@ class SimpleGradingUI:
                 method_count = sum(len(p.get("methods") or [])
                                    for p in (card.get("parts") or [])) if isinstance(card, dict) else 0
                 line2 += f"（评分卡：{part_count}小问/{method_count}套解法）"
+        elif grammar_issues:
+            ok = False
+            line2 = "✗ 给分点：" + grammar_issues[0]
         else:
             ok = True
             line2 = "给分点：未填，由 AI 拆分"
@@ -2903,6 +2439,8 @@ class SimpleGradingUI:
                     status_text += f" · 总分上限 {fmt_score(rules['score_cap'])} 分"
                 self.rubric_status.config(text=status_text,
                                           fg=T['ok'] if ok else T['danger'])
+            elif grammar_issues:
+                self.rubric_status.config(text="✗ " + grammar_issues[0], fg=T['danger'])
             else:
                 self.rubric_status.config(text="", fg=T['sub'])
 
@@ -3065,9 +2603,10 @@ class SimpleGradingUI:
         if self.saved_rubric:
             self.rubric_text.delete('1.0', tk.END)
             self.rubric_text.insert('1.0', self.saved_rubric)
-        if self.saved_question_text:
-            self.question_text.delete('1.0', tk.END)
-            self.question_text.insert('1.0', self.saved_question_text)
+        if getattr(self, 'saved_material_text', ''):
+            self.material_text.delete('1.0', tk.END)
+            self.material_text.insert('1.0', self.saved_material_text)
+        self._refresh_material_label()
         if self.grading_guide:
             self.guide_text.delete('1.0', tk.END)
             self.guide_text.insert('1.0', self.grading_guide)
@@ -3305,6 +2844,14 @@ class SimpleGradingUI:
         """取本次判分用的评分卡：已确认且与当前标准一致的卡优先；
         否则按当前标准自动生成；生成不了就用整题兜底卡。不会静默改用别的评分方式。"""
         rubric = self.rubric_text.get('1.0', tk.END).strip()
+        if gc.is_points_text(rubric):
+            card, issues = points_text_card(standard_answer, rubric, question_num, max_score_f)
+            if issues:
+                raise Exception("给分点格式有问题，请在编辑窗口改好再批：\n" + "\n".join(issues[:5]))
+            if gc.AI_MARK.strip("（）") in rubric:
+                self.log("  ⚠ 给分点里还有“AI拟分”的行，分值未经你确认")
+            self._log_card(card)
+            return card
         card = getattr(self, 'rubric_card', None)
         if card:
             card = upgrade_rubric_card(card, max_score_f)
@@ -3321,6 +2868,10 @@ class SimpleGradingUI:
                 if card.get("parts")[0]["methods"][0]["points"][0]["text"].startswith("按参考答案整体"):
                     self.log("  ⚠ 没能从评分标准拆出给分点，本题按整题一个采分点判分；"
                              "建议在「评分卡」里拆分后再批")
+        self._log_card(card)
+        return card
+
+    def _log_card(self, card):
         fp = card.get("fingerprint") or id(card)
         if getattr(self, '_card_logged', None) != fp:
             self._card_logged = fp
@@ -3614,13 +3165,16 @@ class SimpleGradingUI:
         """REST 直连，不再依赖已停止维护的 google.generativeai SDK。"""
         self.model = None
 
-    def call_ai_api(self, prompt, image, need_json=True, timeout=None):
+    def call_ai_api(self, prompt, image, need_json=True, timeout=None, prep=False):
         """调用当前选定的提供商和模型。
 
         不再自动换模型：同一批卷子必须由同一个模型批，评分尺度才一致。
         额度用尽、网络出错时直接报错并停下，由老师决定是否换模型。
         timeout：默认用批改上限 GRADE_TIMEOUT；备课时（生成指南、识别）可放宽。"""
         self._timeout_now = timeout or GRADE_TIMEOUT
+        # 备课（一键生成）：输出长、图片是几张拼起来的长图，放宽输出长度和图片尺寸
+        self._max_tokens_now = 8192 if prep else 4096
+        self._max_side_now = 4096 if prep else 1600
         try:
             return self._call_ai_api_once(prompt, image, need_json)
         except Exception as e:
@@ -3634,14 +3188,14 @@ class SimpleGradingUI:
         """OpenAI 兼容的识图调用：灰度压缩 + 流式 + 自动关思考。"""
         if not base_url or not model:
             raise Exception("API 地址或模型名为空")
-        data_url = image_to_data_url(image, max_side=1600)
+        data_url = image_to_data_url(image, max_side=getattr(self, '_max_side_now', 1600))
         data = {
             "model": model,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": data_url}},
             ]}],
-            "max_tokens": 4096,
+            "max_tokens": getattr(self, '_max_tokens_now', 4096),
             "temperature": 0.1,
         }
         data.update(no_think_params(model, base_url))
@@ -3669,7 +3223,8 @@ class SimpleGradingUI:
             import json as _json
             img_io = io.BytesIO()
             im = image.convert("RGB")
-            im.thumbnail((1600, 1600))
+            side = getattr(self, '_max_side_now', 1600)
+            im.thumbnail((side, side))
             im.save(img_io, format="JPEG", quality=88)
             img_b64 = base64.b64encode(img_io.getvalue()).decode()
             gen_cfg = {"temperature": 0.1,
@@ -4702,7 +4257,9 @@ class SimpleGradingUI:
                 'rubric': self.saved_rubric,
                 'rubric_card': getattr(self, 'rubric_card', None),
                 'question_text': self._question_now(),
-                'question_img_path': self.question_img_path,
+                'material_imgs': list(getattr(self, 'material_imgs', []) or []),
+                'material_text': self.material_text.get('1.0', tk.END).strip() if hasattr(self, 'material_text')
+                                 else getattr(self, 'saved_material_text', ''),
                 'grading_guide': self._guide_now(),
                 'guide_fp': self.guide_fp,
                 'half_point': self.half_point,
@@ -4745,7 +4302,8 @@ class SimpleGradingUI:
                 self.saved_rubric = config.get('rubric', '')
                 self.rubric_card = config.get('rubric_card') or None
                 self.saved_question_text = config.get('question_text', '') or ''
-                self.question_img_path = config.get('question_img_path', '') or ''
+                self.material_imgs = list(config.get('material_imgs') or [])
+                self.saved_material_text = config.get('material_text', '') or ''
                 self.grading_guide = config.get('grading_guide', '') or ''
                 self.guide_fp = config.get('guide_fp', '') or ''
                 if self.rubric_card:

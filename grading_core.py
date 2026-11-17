@@ -227,6 +227,196 @@ def guide_new_scores(guide, original_texts, max_score=None):
         allowed.add(float(max_score))
     return sorted({x for x in score_numbers(guide) if x not in allowed})
 
+
+# ---------------------------------------------------------------- 给分点文本 ⇄ 评分卡（v1.13）
+#
+# 给分点框就是评分卡，老师直接看、直接改。格式：
+#   （1）满分 6 分
+#   解法一：设点法
+#   求得 $k=2$｜2
+#   写出直线方程 $y=2x+1$｜4
+#   解法二：参数法
+#   ……｜6
+#   （2）满分 6 分
+#   ……
+#   评分说明：
+#   最多得 12 分
+# 没有小问的题写“全题 满分 12 分”。分值后面带“（AI拟分）”表示是 AI 提议、老师还没确认。
+
+POINTS_FORMAT = """【给分点格式】
+（1）满分 N 分          ← 每个小问一行；没有小问写“全题 满分 N 分”
+解法一：解法名称        ← 每种解法一行，只有一种解法也要写“解法一：”
+得分步骤要点｜分值      ← 每个得分步骤一行，竖线后面只写数字
+评分说明：              ← 可选，放最后，下面每条一行"""
+
+AI_MARK = "（AI拟分）"
+_PART_RE = re.compile(r"^\s*(?:[（(]\s*([0-9]+|[ⅠⅡⅢⅣⅤ]|[一二三四五])\s*[)）]|第\s*([0-9]+|[一二三四五])\s*问|(全题))"
+                      r"\s*[：:]?\s*满分\s*([0-9]+(?:\.[0-9]+)?)\s*分?\s*$")
+_METHOD_RE = re.compile(r"^\s*解法\s*([一二三四五六七八九十0-9]+)\s*[：:]?\s*(.*)$")
+_POINT_RE = re.compile(r"^\s*(.+?)\s*[|｜]\s*([0-9]+(?:\.[0-9]+)?)\s*分?\s*((?:[（(]\s*AI\s*拟分\s*[)）])?)\s*$")
+_CAP_RE = re.compile(r"(?:最多|最高|至多|不超过|上限)\D{0,8}?([0-9]+(?:\.[0-9]+)?)\s*分")
+
+
+def is_points_text(text):
+    """给分点框是不是新格式（至少有一行“（1）满分 N 分”或“全题 满分 N 分”）。"""
+    return any(_PART_RE.match(line) for line in (text or "").splitlines())
+
+
+def card_from_points_text(text, max_score=None):
+    """把给分点文本解析成评分卡。返回 (card, issues, ai_lines)。
+    issues 非空表示不能用；ai_lines 是带“AI拟分”标记、还要老师确认的行。"""
+    parts, rules, issues, ai_lines = [], [], [], []
+    part = method = None
+    in_rules = False
+    for n, raw in enumerate((text or "").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if re.match(r"^评分说明\s*[：:]?\s*$", line):
+            in_rules = True
+            continue
+        if in_rules:
+            rules.append(line)
+            continue
+        m = _PART_RE.match(line)
+        if m:
+            pid = str(len(parts) + 1)
+            title = "全题" if m.group(3) else f"第{pid}问"
+            part = {"id": pid, "title": title, "max_score": float(m.group(4)), "methods": []}
+            parts.append(part)
+            method = None
+            continue
+        m = _METHOD_RE.match(line)
+        if m:
+            if part is None:
+                issues.append(f"第{n}行“{line[:12]}”前面缺少“（1）满分 N 分”这样的小问行")
+                continue
+            mid = f"{part['id']}-{chr(65 + len(part['methods']))}"
+            method = {"id": mid, "name": (m.group(2) or f"解法{m.group(1)}").strip(), "notes": "", "points": []}
+            part["methods"].append(method)
+            continue
+        m = _POINT_RE.match(line)
+        if m:
+            if part is None:
+                issues.append(f"第{n}行“{line[:12]}”前面缺少“（1）满分 N 分”这样的小问行")
+                continue
+            if method is None:
+                method = {"id": f"{part['id']}-A", "name": "解法一", "notes": "", "points": []}
+                part["methods"].append(method)
+            if m.group(3):
+                ai_lines.append(line)
+            pt_text = m.group(1).strip()
+            method["points"].append({
+                "id": f"{method['id']}-{len(method['points']) + 1}",
+                "text": pt_text, "goal": pt_text, "full": float(m.group(2)),
+                "band": False, "levels": [], "result_only": False, "shared": False,
+                "equivalents": [], "notes": "", "deductions": [], "required": [pt_text],
+                "aliases": {}, "zero_if": [],
+            })
+            continue
+        issues.append(f"第{n}行看不懂：“{line[:20]}”（得分步骤要写成“要点｜分值”）")
+
+    if not parts:
+        issues.append("没有找到“（1）满分 N 分”或“全题 满分 N 分”")
+    total = 0.0
+    for part in parts:
+        total += part["max_score"]
+        if not part["methods"]:
+            issues.append(f"{part['title']}没有得分步骤")
+        for method in part["methods"]:
+            if not method["points"]:
+                issues.append(f"{part['title']} {method['name']} 没有得分步骤")
+                continue
+            got = sum(p["full"] for p in method["points"])
+            if abs(got - part["max_score"]) > 0.01:
+                issues.append(f"{part['title']} {method['name']} 合计 {fmt(got)} 分，和这一问满分 {fmt(part['max_score'])} 分不一致")
+    if max_score and parts and abs(total - float(max_score)) > 0.01:
+        issues.append(f"各小问满分合计 {fmt(total)} 分，和本题满分 {fmt(max_score)} 分不一致")
+
+    cap, cap_text = None, ""
+    for r in rules:
+        m = _CAP_RE.search(r)
+        if m and (not max_score or float(m.group(1)) <= float(max_score) + 1e-9):
+            cap, cap_text = float(m.group(1)), r
+    flat = []
+    for part in parts:
+        if part["methods"]:
+            for p in part["methods"][0]["points"]:
+                item = dict(p)
+                item["part_id"] = part["id"]
+                item["method_id"] = part["methods"][0]["id"]
+                flat.append(item)
+    card = {
+        "version": 3, "score_mode": "points", "source": "points_text", "cumulative": False, "cumulative_raw": [],
+        "max_score": float(max_score or total or 0), "parts": parts, "points": flat, "aliases": {},
+        "rules": [r for r in rules if r != cap_text][:12], "score_cap": cap, "cap_text": cap_text,
+        "zero_rules": [], "deduction_rules": [],
+    }
+    return card, issues, ai_lines
+
+
+def strip_ai_marks(text):
+    return re.sub(r"\s*[（(]\s*AI\s*拟分\s*[)）]", "", text or "")
+
+
+def build_materials_prompt(question_num, max_score, text_materials="", n_images=1):
+    """材料箱：原题、官方答案、老师手写的其他解法等一起给模型，一次生成
+    原题文字 + 统一格式参考答案 + 给分点 + 批改指南。"""
+    txt = f"\n【老师粘贴的文字材料】\n{text_materials.strip()}\n" if (text_materials or "").strip() else ""
+    img = (f"图片是老师给的材料（{n_images} 张截图从上到下拼在一起，用分隔线隔开），"
+           "可能有原题、官方参考答案和评分标准、老师手写的其他解法。") if n_images else "老师没有给图片。"
+    return f"""你是高中数学阅卷组长，要为第{question_num}题（满分{fmt(max_score)}分）准备阅卷材料。{img}
+{txt}
+请先认清每份材料是什么，再输出四部分。
+
+一、原题：把题目原样转写（只要题目，不要解答）。
+
+二、参考答案：把官方答案和老师给的其他解法整理成统一格式。官方答案排“解法一”，老师的其他解法依次排“解法二”“解法三”……内容和式子照抄，不能改、不能删、不能补。
+{FORMAT_SPEC}
+
+三、给分点：按下面的格式写。
+{POINTS_FORMAT}
+规则：
+- 官方答案和老师标了分的步骤，分值照抄，一分不能改。
+- 某种解法没有标分值时，参照解法一相同作用的步骤给出分值，并在这一行最后加“{AI_MARK}”，等老师确认。
+- 每种解法的分值合计必须等于这一问的满分；各问满分合计必须等于 {fmt(max_score)} 分。
+- 要点写成能判断的数学结果，例如“求得 $k=2$”，不要只写“计算”“证明”。
+
+四、批改指南：按给分点的顺序，每个得分步骤一段：
+【第几问 · 解法几 · 要点】
+必须看到：……
+等价也对：……
+部分给分：评分标准写了就照写，没写就写“按评分标准”
+常见错误：……（没有就写“无”）
+指南里不能出现任何新的分值；每段不超过 5 行。
+
+严格按下面的格式输出，不要输出其他内容：
+===原题===
+（原题）
+===参考答案===
+（参考答案）
+===给分点===
+（给分点）
+===批改指南===
+（批改指南）"""
+
+
+def parse_sections(text, names=("原题", "参考答案", "给分点", "批改指南")):
+    """按 ===名称=== 切分模型输出，返回 {名称: 内容}，缺的为空串。"""
+    text = (text or "").replace("\r\n", "\n").strip()
+    text = re.sub(r"^```[a-zA-Z]*\n|\n```\s*$", "", text)
+    marks = []
+    for name in names:
+        m = re.search(r"={2,}\s*" + name + r"\s*={2,}", text)
+        if m:
+            marks.append((m.start(), m.end(), name))
+    marks.sort()
+    out = {name: "" for name in names}
+    for i, (_s, e, name) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
+        out[name] = text[e:end].strip()
+    return out
+
 # ---------------------------------------------------------------- 提示词
 
 def _card_text(card):
