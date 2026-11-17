@@ -161,7 +161,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.14.1"
 CARD_VERSION = 3
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
@@ -186,16 +186,30 @@ def check_update(custom_base=""):
     import urllib.request
     bases = [custom_base] if custom_base else [b.format(repo=UPDATE_REPO, branch=UPDATE_BRANCH) for b in UPDATE_SOURCES]
     last_err = None
+    best = None
+    # 每个源都问一遍，取版本最高的：镜像缓存旧了也不会把新版本藏起来
     for base in bases:
         try:
             url = base.rstrip("/") + "/version.json?t=" + str(int(time.time()))
             req = urllib.request.Request(url, headers={"User-Agent": f"ZhixueGrader/{APP_VERSION}", "Cache-Control": "no-cache"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 info = json.loads(r.read().decode("utf-8-sig"))
-            return _ver_tuple(info.get("version", "0")) > _ver_tuple(APP_VERSION), info, base
+            if best is None or _ver_tuple(info.get("version", "0")) > _ver_tuple(best[0].get("version", "0")):
+                best = (info, base)
         except Exception as e:
             last_err = e
-    raise Exception(f"无法连接更新服务器：{last_err}")
+    if best is None:
+        raise Exception(f"无法连接更新服务器：{last_err}")
+    info, base = best
+    return _ver_tuple(info.get("version", "0")) > _ver_tuple(APP_VERSION), info, base
+
+
+def _file_base(info, base):
+    """jsDelivr 的 @main 各节点缓存不一致；有版本标签就按标签下载（标签内容固定，不会拿到旧文件）。"""
+    tag = str(info.get("tag") or "").strip()
+    if tag and "cdn.jsdelivr.net" in base and re.fullmatch(r"[0-9A-Za-z._-]+", tag):
+        return f"https://cdn.jsdelivr.net/gh/{UPDATE_REPO}@{tag}/"
+    return base
 
 
 def apply_update(info, base):
@@ -206,6 +220,7 @@ def apply_update(info, base):
     if isinstance(files, list):
         files = {f: "" for f in files}
     staged = {}
+    base = _file_base(info, base)
     for name, sha in files.items():
         if ".." in name or os.path.isabs(name) or name.endswith("config.json"):
             continue  # 安全：不允许写到程序目录之外，也绝不覆盖用户配置

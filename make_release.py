@@ -7,6 +7,7 @@ src = open("zhixue_simple.py", encoding="utf-8").read()
 version = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', src, re.M).group(1)
 notes = sys.argv[1] if len(sys.argv) > 1 else ""
 files = {f: hashlib.sha256(open(f, "rb").read()).hexdigest() for f in FILES}
-json.dump({"version": version, "notes": notes, "files": files},
+json.dump({"version": version, "notes": notes, "files": files, "tag": f"v{version}"},
           open("version.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 print(f"version.json 已生成：v{version}")
+print(f"提交后记得：git tag v{version} && git push origin v{version}（镜像按标签下载，不受缓存影响）")
