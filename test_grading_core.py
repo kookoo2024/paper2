@@ -209,6 +209,10 @@ check("四段输出解析", sec == {"原题": "Q", "参考答案": "A", "给分�
 mp = gc.build_materials_prompt("18", 12, "老师的文字", 3)
 check("材料箱提示词", "3 张截图" in mp and "老师的文字" in mp and "===给分点===" in mp and gc.AI_MARK in mp)
 
+rp = gc.build_revise_prompt("18", 12, "原题Q", "答案A", "（1）满分 12 分\nx｜12", "指南G", ["新意见1"], ["旧意见0"], 2)
+check("意见修订提示词", all(k in rp for k in ("新意见1", "旧意见0", "答案A", "指南G", "===调整说明===", "2 张")))
+check("四段解析含调整说明", gc.parse_sections("===给分点===\nP\n===调整说明===\nN", ("参考答案", "给分点", "批改指南", "调整说明"))["调整说明"] == "N")
+
 print()
 print("全部通过" if not failures else f"{len(failures)} 项失败")
 sys.exit(1 if failures else 0)

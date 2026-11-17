@@ -1,10 +1,10 @@
 {
-  "version": "1.13.0",
-  "notes": "材料箱：原题、官方答案、手写解法多张截图+文字一起放，一键生成原题、统一格式参考答案（多解法）、给分点、批改指南，预览核对后确认；去掉评分卡窗口，给分点框即评分卡（（1）满分N分/解法一：/要点｜分值），格式错误批改会停下提示；学生用哪套解法按哪套判",
+  "version": "1.14.0",
+  "notes": "批改中途提意见：确认窗口的意见框或主窗口「💬 意见」（可附当前答卷截图）；提交当前份后自动暂停，按全部意见一次整体修订参考答案、给分点、批改指南，预览（含调整说明、分值核对）确认后自动继续，后面的试卷按新规范批，已提交的不动",
   "files": {
-    "zhixue_simple.py": "b6cf2b47dcec2c4a7d33f9e8ad813a9eec39ae6ffc4c925990d8512bc124a923",
-    "grading_core.py": "a4255cb0eeea2cf7b9662f5c2a61e276caa0a11bf72104675a16f1ba346ac2fb",
-    "README.md": "39be4a5f4b7f9e0401d14cf20b1a52861a4f337c25fedf2f813facaacba0c8a2",
+    "zhixue_simple.py": "92d796fd14f8a60a313722e940790595258a7a144798cb04fe121fba1ef0f349",
+    "grading_core.py": "4aaa6f72c01a297fb90f6430ebd41c1226bb6913ab2b41b2d5e2baff1a2c959b",
+    "README.md": "5fed2fa92642941fcb67b204d5f395ff9bed7ceb91fc60e1821593c1c5b3ba43",
     "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3",
     "eval.py": "6916dd5ff23ba3591f60be84d0e901a956493d17b562231ce7a387c121a2d675"
   }

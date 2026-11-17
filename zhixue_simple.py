@@ -161,7 +161,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 CARD_VERSION = 3
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
@@ -1760,6 +1760,8 @@ class SimpleGradingUI:
         self.rubric_card = None     # 已确认的结构化评分卡
         self.saved_question_text = ''   # 原题文字（v1.12）
         self.material_imgs = []         # 材料箱截图文件（v1.13）
+        self.opinions = []              # 老师批改中途的意见（v1.14）：[{text, img, time, merged}]
+        self._paused_for_revise = False
         self.grading_guide = ''         # 老师确认过的批改指南
         self.guide_fp = ''              # 指南对应的 原题+答案+给分点+满分 指纹
         self.is_grading = False
@@ -2003,6 +2005,7 @@ class SimpleGradingUI:
 
         head, inner = panel(1, "批改指南", T['orange'], "AI 生成，你确认", row=1)
         head_btn(head, "清空", self.clear_guide, False)
+        head_btn(head, "按意见调整", self.revise_by_opinions, False)
         head_btn(head, "一键生成", self.generate_from_materials, True)
         self.guide_text = text_box(inner)
         self.guide_text.configure(height=5)
@@ -2081,8 +2084,10 @@ class SimpleGradingUI:
         guide = self._guide_now()
         if not guide:
             return 'none', "未生成：批改时不用指南"
+        pend = len(self._pending_opinions())
+        tail = f"；还有 {pend} 条意见没合并" if pend else ""
         if self.guide_fp and self.guide_fp == self._current_guide_fp():
-            return 'ok', "✓ 已确认，批改时会一起发给模型"
+            return 'ok', "✓ 已确认，批改时会一起发给模型" + tail
         return 'stale', "✗ 答案/给分点/满分改过，指南已过期，批改时不用；请重新生成"
 
     def _guide_edited(self):
@@ -2194,6 +2199,132 @@ class SimpleGradingUI:
                 y += gap
         return out
 
+    # ---------- 批改中途的意见（v1.14） ----------
+    def _pending_opinions(self):
+        return [o for o in (self.opinions or []) if not o.get("merged")]
+
+    def open_opinion_dialog(self):
+        """主窗口「💬 意见」：随时写意见；连续批改中会在当前这份提交后暂停。"""
+        T, F = self.THEME, self.FONT
+        win = tk.Toplevel(self.root)
+        win.title("对评分规范的意见")
+        win.configure(bg=T['bg'])
+        win.geometry("480x300")
+        win.transient(self.root)
+        win.attributes('-topmost', True)
+        tk.Label(win, text=f"第 {self.question_num_entry.get().strip() or '?'} 题：写下你发现的问题或给分意见",
+                 font=(F, 10, 'bold'), bg=T['bg'], fg=T['text'], anchor='w').pack(fill=tk.X, padx=12, pady=(10, 4))
+        box = tk.Text(win, height=7, font=(F, 10), wrap=tk.WORD, relief=tk.FLAT, bg=T['input'],
+                      highlightthickness=1, highlightbackground=T['line'])
+        box.pack(fill=tk.BOTH, expand=True, padx=12)
+        has_img = getattr(self, 'current_student_img', None) is not None
+        attach = tk.BooleanVar(value=has_img)
+        if has_img:
+            tk.Checkbutton(win, text="附上刚才这份答卷的截图（让 AI 看到具体情况）", variable=attach,
+                           bg=T['bg'], font=(F, 9), anchor='w').pack(fill=tk.X, padx=12, pady=(4, 0))
+        tk.Label(win, text="提交后：正在连续批改的话，当前这份照常提交，然后暂停，整理好规范、你确认后接着批后面的",
+                 font=(F, 8), bg=T['bg'], fg=T['sub'], anchor='w', wraplength=450,
+                 justify=tk.LEFT).pack(fill=tk.X, padx=12, pady=4)
+
+        def ok():
+            text = box.get('1.0', tk.END).strip()
+            if not text:
+                return
+            win.destroy()
+            self.add_opinion(text, self.current_student_img if (has_img and attach.get()) else None)
+
+        bar = tk.Frame(win, bg=T['bg'])
+        bar.pack(fill=tk.X, padx=12, pady=(0, 10))
+        for text, cmd, solid in (("取消", win.destroy, False), ("提交意见", ok, True)):
+            slot = tk.Frame(bar, bg=T['bg'], width=100, height=30)
+            slot.pack_propagate(False)
+            slot.pack(side=tk.RIGHT, padx=(8, 0))
+            b = self._btn(slot, text, cmd, T['teal'] if solid else T['teal_bg'],
+                          fg='white' if solid else T['teal_d'], active=T['teal_d'] if solid else '#C3FAE8',
+                          bold=solid)
+            b.pack(fill=tk.BOTH, expand=True)
+        box.focus_set()
+
+    def add_opinion(self, text, img=None):
+        """记下意见；连续批改中就暂停（当前这份照常提交），马上按全部未合并的意见整理规范。"""
+        path = ""
+        if img is not None:
+            try:
+                img, _ = trim_bottom_taskbar(img)
+                path = os.path.join(self._material_dir(), "opinion_" + datetime.now().strftime("%H%M%S_%f") + ".png")
+                img.save(path)
+            except Exception as e:
+                self.log(f"  ⚠ 保存意见截图失败：{e}")
+                path = ""
+        self.opinions = list(self.opinions or []) + [{
+            "text": text, "img": path, "time": datetime.now().isoformat(timespec="seconds"), "merged": False}]
+        self.save_question_data()
+        self.log(f"💬 已记下意见：{text[:40]}")
+        if self.auto_continue and not self.is_paused:
+            self.toggle_pause()
+            self._paused_for_revise = True
+            self.log("⏸ 当前这份提交后暂停，先按意见整理评分规范")
+        self.revise_by_opinions()
+
+    def revise_by_opinions(self):
+        """把未合并的意见 + 现有规范一次发给模型，整体修订给分点和批改指南，预览确认后用于后面的试卷。"""
+        pending = self._pending_opinions()
+        if not pending:
+            messagebox.showinfo("按意见调整", "没有待合并的意见。批改时在确认窗口或主窗口「💬 意见」里写。",
+                                parent=self.editor if self.editor.winfo_viewable() else self.root)
+            return
+        mx = self._current_max_score()
+        if not mx:
+            messagebox.showinfo("按意见调整", "请先在主窗口填满分。")
+            return
+        old_answer = self.answer_text.get('1.0', tk.END).strip()
+        points = self.rubric_text.get('1.0', tk.END).strip()
+        guide = self._guide_now()
+        question = self._question_now()
+        saved_imgs = self.material_imgs
+        self.material_imgs = [o["img"] for o in pending if o.get("img") and os.path.isfile(o["img"])]
+        img = self._stitch_materials()
+        n_images = len(self.material_imgs) if img is not None else 0
+        self.material_imgs = saved_imgs
+        if img is None:
+            img = Image.new("RGB", (64, 64), "white")
+        merged = [o["text"] for o in (self.opinions or []) if o.get("merged")]
+        prompt = gc.build_revise_prompt(self.question_num_entry.get().strip(), mx, question, old_answer,
+                                        points, guide, [o["text"] for o in pending], merged, n_images)
+        ids = [o["time"] for o in pending]
+        self.log(f"正在按 {len(pending)} 条意见整理评分规范（约 30–90 秒）...")
+        if hasattr(self, 'guide_status'):
+            self.guide_status.config(text="⏳ 按意见整理中…", fg=self.THEME['sub'])
+
+        def worker():
+            try:
+                t0 = time.time()
+                text = self.call_ai_api(prompt, img, need_json=False, timeout=PREP_LONG_TIMEOUT, prep=True)
+                sec = gc.parse_sections(text, ("参考答案", "给分点", "批改指南", "调整说明"))
+                sec["原题"] = question
+                self.log(f"✓ 已整理（{time.time() - t0:.0f}s），请在预览里确认")
+                self.ui(lambda: self._materials_preview(old_answer, sec, mx, revise_ids=ids))
+            except Exception as e:
+                err = str(e)
+                self.log(f"⚠ 按意见整理失败: {err}")
+                self.ui(lambda: (messagebox.showerror("错误", f"按意见整理失败：{err}\n\n可以在编辑窗口点「按意见调整」重试；"
+                                                              "点「继续」则按原规范批后面的。"),
+                                 self.refresh_answer_summary()))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_revise(self, confirmed, ids=()):
+        if confirmed:
+            for o in self.opinions or []:
+                if o.get("time") in ids:
+                    o["merged"] = True
+            self.save_question_data()
+            self.log(f"✓ 已合并 {len(ids)} 条意见，后面的试卷按新规范批改")
+            if self._paused_for_revise and self.is_paused:
+                self.toggle_pause()
+        elif self._paused_for_revise and self.is_paused:
+            self.log("⏸ 没有采用整理结果，仍在暂停：点「继续」按原规范批，或在编辑窗口点「按意见调整」重试")
+        self._paused_for_revise = False
+
     def generate_from_materials(self):
         """材料箱 + 现有参考答案/给分点 → 一次调用 → 原题、统一格式答案、给分点、批改指南 → 预览确认。"""
         mx = self._current_max_score()
@@ -2236,23 +2367,30 @@ class SimpleGradingUI:
                                  self.refresh_answer_summary()))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _materials_preview(self, old_answer, sec, mx):
+    def _materials_preview(self, old_answer, sec, mx, revise_ids=None):
         """预览四部分：原题 / 参考答案 / 给分点 / 批改指南。都能改，确认后才生效。"""
         T, F = self.THEME, self.FONT
+        revise = revise_ids is not None
+        parent = self.editor if self.editor.winfo_viewable() else self.root
         if not (sec.get("给分点") or sec.get("参考答案")):
-            messagebox.showerror("一键生成", "模型没有按格式返回内容，请再点一次「一键生成」。", parent=self.editor)
+            messagebox.showerror("一键生成", "模型没有按格式返回内容，请再试一次。", parent=parent)
             self.refresh_answer_summary()
+            if revise:
+                self._after_revise(False)
             return
-        win = tk.Toplevel(self.editor)
-        win.title("确认：原题 · 参考答案 · 给分点 · 批改指南")
+        win = tk.Toplevel(parent)
+        win.title("确认：按意见调整后的评分规范" if revise else "确认：原题 · 参考答案 · 给分点 · 批改指南")
         win.configure(bg=T['bg'])
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         win.geometry(f"{min(1250, int(sw * 0.85))}x{min(880, int(sh * 0.9))}")
-        win.transient(self.editor)
+        win.transient(parent)
         win.attributes('-topmost', True)
 
         top = tk.Frame(win, bg=T['bg'], padx=12, pady=6)
         top.pack(fill=tk.X)
+        if revise and sec.get("调整说明"):
+            tk.Label(top, text="调整说明：\n" + sec["调整说明"], font=(F, 10), bg=T['teal_bg'], fg=T['text'],
+                     anchor='w', justify=tk.LEFT, wraplength=1100, padx=8, pady=6).pack(fill=tk.X, pady=(0, 6))
         status = tk.Label(top, text="", font=(F, 10, 'bold'), bg=T['bg'], anchor='w', justify=tk.LEFT)
         status.pack(fill=tk.X)
 
@@ -2329,12 +2467,25 @@ class SimpleGradingUI:
             self.refresh_answer_summary()
             self.log("✓ 已确认：参考答案、给分点、批改指南已更新（答案框/给分点框里按 Ctrl+Z 可撤销）")
             win.destroy()
+            if revise:
+                self._after_revise(True, revise_ids)
+            else:
+                self.opinions = []      # 重新备课：旧意见作废
+                self.save_question_data()
+
+        def cancel():
+            win.destroy()
+            if revise:
+                self._after_revise(False)
+
+        win.protocol("WM_DELETE_WINDOW", cancel)
 
         bottom = tk.Frame(win, bg=T['bg'], padx=12, pady=10)
         bottom.pack(fill=tk.X)
-        tk.Label(bottom, text="确认后会替换编辑窗口里的参考答案和给分点", font=(F, 9), bg=T['bg'],
+        tk.Label(bottom, text=("确认后用于后面的试卷，已提交的不变" if revise else
+                               "确认后会替换编辑窗口里的参考答案和给分点"), font=(F, 9), bg=T['bg'],
                  fg=T['sub']).pack(side=tk.LEFT)
-        for text, cmd, solid in (("取消", win.destroy, False), ("确认使用", confirm, True),
+        for text, cmd, solid in (("取消", cancel, False), ("确认使用", confirm, True),
                                  ("重新检查", check, False)):
             slot = tk.Frame(bottom, bg=T['bg'], width=100, height=30)
             slot.pack_propagate(False)
@@ -2530,6 +2681,9 @@ class SimpleGradingUI:
         self.pause_btn = self._btn(s, "⏸ 暂停", self.toggle_pause, T['slate'], size=10, bold=True,
                                    state=tk.DISABLED, disabledforeground='#C3FAE8')
         self.pause_btn.pack(fill=tk.BOTH, expand=True)
+        s = self._slot(big, width=64, height=self.BIG_H, side=tk.RIGHT, padx=(0, 6))
+        self._btn(s, "💬 意见", self.open_opinion_dialog, T['orange'], size=10, bold=True,
+                  active=T['orange']).pack(fill=tk.BOTH, expand=True)
         s = self._slot(big, height=self.BIG_H, side=tk.LEFT, padx=(0, 6), expand=True)
         self.grade_btn = self._btn(s, self.GRADE_TEXT, self.grade_answer, T['primary'], size=10, bold=True,
                                    active=T['primary_d'])
@@ -3834,7 +3988,7 @@ class SimpleGradingUI:
         # 创建自定义对话框
         dialog = tk.Toplevel(self.root)
         dialog.title("确认分数")
-        dialog.geometry("520x560")
+        dialog.geometry("520x640")
         dialog.transient(self.root)
         dialog.attributes('-topmost', True)
         dialog.grab_set()
@@ -3877,6 +4031,14 @@ class SimpleGradingUI:
         detail_scroll.pack(fill=tk.BOTH, expand=True)
         detail_scroll.insert('1.0', detail_text)
         detail_scroll.config(state=tk.DISABLED)
+
+        # v1.14：意见。填了就会在这份提交后暂停，按意见整理评分规范，确认后用于后面的试卷
+        tk.Label(content_frame, text="意见（可选）：发现评分规范的问题就写在这里，提交后会暂停并整理规范",
+                 font=('微软雅黑', 8), fg='#868e96', anchor='w').pack(fill=tk.X)
+        opinion_box = tk.Text(content_frame, height=3, font=('微软雅黑', 9), wrap=tk.WORD,
+                              relief=tk.FLAT, highlightthickness=1, highlightbackground='#dee2e6')
+        opinion_box.pack(fill=tk.X, pady=(2, 10))
+        opinion_box.bind('<Return>', lambda e: None)   # 意见框里回车只换行
         
         # 按钮框架
         btn_frame = tk.Frame(content_frame)
@@ -3890,6 +4052,7 @@ class SimpleGradingUI:
                 messagebox.showwarning("分数格式", "请输入数字，例如 12 或 10.5", parent=dialog)
                 return
             final_score = fmt_score(max(0, min(final_score, float(max_score))))
+            opinion = opinion_box.get('1.0', tk.END).strip()
             if final_score != score:
                 self.log(f"✏ 人工改分: {score} → {final_score}")
                 self.save_correction_case(score, final_score, max_score)
@@ -3900,6 +4063,8 @@ class SimpleGradingUI:
             dialog.destroy()
             self._raise_window()
             self.log(f"\n✅ 用户确认分数: {self.pending_score}")
+            if opinion:
+                self.add_opinion(opinion, getattr(self, 'current_student_img', None))
             
             # 如果开启自动点击
             if self.auto_click_var.get():
@@ -3954,7 +4119,7 @@ class SimpleGradingUI:
         reject_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
         
         # 绑定快捷键
-        dialog.bind('<Return>', lambda e: on_accept())
+        dialog.bind('<Return>', lambda e: None if e.widget is opinion_box else on_accept())
         dialog.bind('<Escape>', lambda e: on_reject())
         
         # 聚焦分数输入框，方便直接改分；回车提交
@@ -4258,6 +4423,7 @@ class SimpleGradingUI:
                 'rubric_card': getattr(self, 'rubric_card', None),
                 'question_text': self._question_now(),
                 'material_imgs': list(getattr(self, 'material_imgs', []) or []),
+                'opinions': list(getattr(self, 'opinions', []) or []),
                 'material_text': self.material_text.get('1.0', tk.END).strip() if hasattr(self, 'material_text')
                                  else getattr(self, 'saved_material_text', ''),
                 'grading_guide': self._guide_now(),
@@ -4303,6 +4469,7 @@ class SimpleGradingUI:
                 self.rubric_card = config.get('rubric_card') or None
                 self.saved_question_text = config.get('question_text', '') or ''
                 self.material_imgs = list(config.get('material_imgs') or [])
+                self.opinions = list(config.get('opinions') or [])
                 self.saved_material_text = config.get('material_text', '') or ''
                 self.grading_guide = config.get('grading_guide', '') or ''
                 self.guide_fp = config.get('guide_fp', '') or ''
