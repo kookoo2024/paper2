@@ -161,7 +161,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.14.1"
+APP_VERSION = "1.14.2"
 CARD_VERSION = 3
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
@@ -2974,8 +2974,17 @@ class SimpleGradingUI:
             mx = float(self.max_score_entry.get().strip())
         except ValueError:
             mx = None
-        scored, _src, rules = resolve_rubric_points(
-            self.rubric_text.get('1.0', tk.END), answer_text, mx)
+        rubric_now = self.rubric_text.get('1.0', tk.END)
+        if gc.is_points_text(rubric_now):
+            # 新格式按“每套解法合计 = 这一问满分”核对；多套解法不能加在一起算
+            _card, issues, _ai = gc.card_from_points_text(rubric_now, mx)
+            if issues:
+                messagebox.showerror("给分点有问题", "给分点还有问题，请先改好：\n\n" + "\n".join(issues[:6]))
+                self.open_answer_editor()
+                return
+            scored = []
+        else:
+            scored, _src, rules = resolve_rubric_points(rubric_now, answer_text, mx)
         if scored and not self.auto_continue and mx is not None:
             total = sum(v for _, v in scored)
             if abs(total - mx) > 0.01:

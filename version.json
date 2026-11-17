@@ -1,12 +1,12 @@
 {
-  "version": "1.14.1",
-  "notes": "v1.14.1：在线更新更稳——同时问 GitHub 和国内镜像取最高版本；镜像按版本标签下载，不会拿到缓存的旧文件。含 v1.14.0：批改中途提意见（确认窗口意见框/主窗口「💬 意见」），暂停后按意见整体修订评分规范，确认后用于后面的试卷",
+  "version": "1.14.2",
+  "notes": "v1.14.2：修复——给分点里有多套解法时，开始批改前的核对把各套解法的分加在一起，误报“给分点合计超过满分”；现在按每套解法分别核对",
   "files": {
-    "zhixue_simple.py": "d143d148b776190f8bb730e742db30374177591df88dea89fe39a668706a6874",
+    "zhixue_simple.py": "af6485269dfc7ec04acbf232d311c97f81f4ffe9e9ed81726cc58be443bd14e5",
     "grading_core.py": "4aaa6f72c01a297fb90f6430ebd41c1226bb6913ab2b41b2d5e2baff1a2c959b",
     "README.md": "5fed2fa92642941fcb67b204d5f395ff9bed7ceb91fc60e1821593c1c5b3ba43",
     "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3",
     "eval.py": "6916dd5ff23ba3591f60be84d0e901a956493d17b562231ce7a387c121a2d675"
   },
-  "tag": "v1.14.1"
+  "tag": "v1.14.2"
 }
