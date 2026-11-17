@@ -148,6 +148,31 @@ for junk in (None, {}, {"parts": "x"}, {"parts": [None, 3]}):
     except Exception as e:
         check(f"异常返回 {junk} 不崩溃", False, repr(e))
 
+# ---- v1.12 统一格式 / 批改指南 ----
+orig = "（1）求得 k=2 （2分）\n所以直线方程 y=2x+1（2分）\n（2）联立得 x^2-4x+3=0（3分）\n评分说明：最多得 7 分"
+norm = "（1）求得 $k=2$（2分）\n所以直线方程 $y=2x+1$（2分）\n（2）联立得 $x^2-4x+3=0$（3分）\n评分说明：\n最多得 7 分"
+ok, msg = gc.check_scores_kept(orig, norm)
+check("整理前后分值一致", ok, msg)
+ok, msg = gc.check_scores_kept(orig, norm.replace("（3分）", "（2分）"))
+check("分值被改能查出来", (not ok) and "少了 3分" in msg and "多了 2分" in msg, msg)
+ok, msg = gc.check_scores_kept(orig, norm.replace("\n（2）联立得 $x^2-4x+3=0$（3分）", ""))
+check("步骤被删能查出来", not ok, msg)
+check("“充分”“部分”“分析”不算分值", gc.score_numbers("充分性 部分 分析 2分析 3 分") == [3.0])
+a2, g2 = gc.parse_guide_output("```\n===参考答案===\nAAA\n=== 批改指南 ===\nGGG\n```")
+check("解析指南输出（带代码块）", a2 == "AAA" and g2 == "GGG", repr((a2, g2)))
+check("只有指南也能解析", gc.parse_guide_output("===批改指南===\nG") == ("", "G"))
+check("没按格式返回 → 两段都空", gc.parse_guide_output("随便说点") == ("", ""))
+check("指南出现新分值能查出来", gc.guide_new_scores("必须看到 k，给 1分", [orig], 7) == [1.0])
+check("指南引用原有分值不报", gc.guide_new_scores("这一步 2分", [orig], 7) == [])
+gp = gc.build_guide_prompt("18", 12, "已知…", orig, "")
+check("指南提示词包含统一格式和两段标记", "===参考答案===" in gp and "===批改指南===" in gp and "$...$" in gp)
+c1 = gc.single_part_card([("整题", 7)], 7)
+p0 = gc.build_prompt("3", 7, orig, c1)
+p1 = gc.build_prompt("3", 7, orig, c1, question_text="题目原文QQ", guide="指南GG")
+check("没有指南时提示词不出现指南段", "【批改指南" not in p0 and "【原题】" not in p0)
+check("有指南时带原题和指南", "题目原文QQ" in p1 and "指南GG" in p1)
+check("识别提示词要求 LaTeX", "LaTeX" in gc.capture_prompt("answer") and "不要解答" in gc.capture_prompt("question"))
+
 print()
 print("全部通过" if not failures else f"{len(failures)} 项失败")
 sys.exit(1 if failures else 0)

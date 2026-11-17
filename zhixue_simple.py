@@ -11,6 +11,7 @@ import json
 import copy
 import os
 import time
+import re
 from datetime import datetime
 import threading
 
@@ -24,6 +25,7 @@ import grading_core as gc
 
 HTTP_TIMEOUT = 120  # 兜底超时（秒）；批改调用会传更短的 15 秒目标
 GRADE_TIMEOUT = 20  # 单题批改硬上限：超过就中止
+PREP_TIMEOUT = 90   # 备课用（截图识别、生成批改指南）：只做一次，可以慢一点
 
 
 # 配置 Gemini API
@@ -158,7 +160,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 CARD_VERSION = 3
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
@@ -1345,6 +1347,12 @@ def rubric_fingerprint(answer_text, rubric_text, max_score):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def guide_fingerprint(question_text, answer_text, rubric_text, max_score):
+    """批改指南的指纹：原题、参考答案、给分点、满分任一改动，指南就过期不用。"""
+    q = str(question_text or "").replace("\r\n", "\n").strip()
+    return rubric_fingerprint(q + "\n##Q##\n" + str(answer_text or ""), rubric_text, max_score)
+
+
 def build_rubric_card(answer_text, rubric_text, question_num, max_score):
     """把评分标准整理成 v2 评分卡：小问 → 多套解法 → 采分点。"""
     points, source, rules = resolve_rubric_points(rubric_text, answer_text, max_score)
@@ -1735,6 +1743,10 @@ class SimpleGradingUI:
         self.cycle_times = []       # 连续批改时相邻两份的真实节奏（含提交、间隔）
         self._last_grade_start = None
         self.rubric_card = None     # 已确认的结构化评分卡
+        self.saved_question_text = ''   # 原题文字（v1.12）
+        self.question_img_path = ''     # 原题截图文件
+        self.grading_guide = ''         # 老师确认过的批改指南
+        self.guide_fp = ''              # 指南对应的 原题+答案+给分点+满分 指纹
         self.is_grading = False
         self.auto_continue = False
         self.is_paused = False  # 暂停状态
@@ -1888,7 +1900,7 @@ class SimpleGradingUI:
         win.withdraw()
         win.title("参考答案与给分点")
         win.configure(bg=T['bg'])
-        win.minsize(760, 520)
+        win.minsize(820, 640)
         win.protocol("WM_DELETE_WINDOW", self.close_answer_editor)
         win.bind('<Escape>', lambda e: self.close_answer_editor())
         win.bind('<Control-s>', lambda e: self.close_answer_editor())
@@ -1910,11 +1922,13 @@ class SimpleGradingUI:
         body.pack(fill=tk.BOTH, expand=True)
         body.grid_columnconfigure(0, weight=3, uniform='ed')
         body.grid_columnconfigure(1, weight=2, uniform='ed')
-        body.grid_rowconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=3)
+        body.grid_rowconfigure(1, weight=2)
 
-        def panel(col, title, color, hint):
+        def panel(col, title, color, hint, row=0):
             outer = tk.Frame(body, bg=T['card'], highlightthickness=1, highlightbackground=T['line'])
-            outer.grid(row=0, column=col, sticky='nsew', padx=(0, 10) if col == 0 else 0)
+            outer.grid(row=row, column=col, sticky='nsew', padx=(0, 10) if col == 0 else 0,
+                       pady=(10, 0) if row else 0)
             head = tk.Frame(outer, bg=T['card'], height=34)
             head.pack_propagate(False)
             head.pack(fill=tk.X, padx=12, pady=(6, 0))
@@ -1960,9 +1974,27 @@ class SimpleGradingUI:
                              "不填也行：优先从参考答案里的评分标准取，再自动拆",
                  font=(F, 8), bg=T['card'], fg=T['sub'], justify=tk.LEFT, anchor='w').pack(fill=tk.X)
 
-        for w in (self.answer_text, self.rubric_text):
+        # v1.12：原题 + 批改指南（备课时生成一次，老师确认后批改才用）
+        head, inner = panel(0, "原题", T['primary'], "截图后自动转成统一格式", row=1)
+        head_btn(head, "清空", self.clear_question, False)
+        head_btn(head, "截原题", self.capture_question, True)
+        self.question_text = text_box(inner)
+        self.question_text.configure(height=5)
+
+        head, inner = panel(1, "批改指南", T['orange'], "原题+答案 → AI 生成，你确认", row=1)
+        head_btn(head, "清空", self.clear_guide, False)
+        head_btn(head, "生成指南", self.generate_guide, True)
+        self.guide_text = text_box(inner)
+        self.guide_text.configure(height=5)
+        self.guide_status = tk.Label(inner, text="", font=(F, 9, 'bold'), bg=T['card'], anchor='w', pady=4)
+        self.guide_status.pack(fill=tk.X)
+
+        for w in (self.answer_text, self.rubric_text, self.question_text):
             w.bind('<KeyRelease>', lambda e: self._editor_changed())
             w.bind('<FocusOut>', lambda e: self._editor_changed())
+        # 老师手改指南内容不算过期（老师就是标准）；只保存
+        self.guide_text.bind('<KeyRelease>', lambda e: self._guide_edited())
+        self.guide_text.bind('<FocusOut>', lambda e: self._guide_edited())
 
     def _editor_changed(self):
         self.save_question_data()
@@ -1972,7 +2004,7 @@ class SimpleGradingUI:
         win = self.editor
         self.refresh_answer_summary()
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        w, h = min(1100, int(sw * 0.75)), min(760, int(sh * 0.8))
+        w, h = min(1150, int(sw * 0.8)), min(900, int(sh * 0.88))
         if not getattr(self, '_editor_placed', False):
             win.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - 30)}")
             self._editor_placed = True
@@ -2006,6 +2038,235 @@ class SimpleGradingUI:
         self.rubric_text.delete('1.0', tk.END)
         self.rubric_text.insert('1.0', "\n".join(found))
         self._editor_changed()
+
+
+    # ---------- 原题 / 批改指南（v1.12） ----------
+    def _question_now(self):
+        return self.question_text.get('1.0', tk.END).strip() if hasattr(self, 'question_text') else \
+            (self.saved_question_text or '')
+
+    def _guide_now(self):
+        return self.guide_text.get('1.0', tk.END).strip() if hasattr(self, 'guide_text') else \
+            (self.grading_guide or '')
+
+    def _current_guide_fp(self):
+        return guide_fingerprint(self._question_now(),
+                                 self.answer_text.get('1.0', tk.END).strip(),
+                                 self.rubric_text.get('1.0', tk.END).strip(),
+                                 self._current_max_score())
+
+    def guide_state(self):
+        """返回 ('none'|'ok'|'stale', 说明)。"""
+        guide = self._guide_now()
+        if not guide:
+            return 'none', "未生成：批改时不用指南"
+        if self.guide_fp and self.guide_fp == self._current_guide_fp():
+            return 'ok', "✓ 已确认，批改时会一起发给模型"
+        return 'stale', "✗ 原题/答案/给分点/满分改过，指南已过期，批改时不用；请重新生成"
+
+    def _guide_edited(self):
+        self.grading_guide = self._guide_now()
+        if not self.grading_guide:
+            self.guide_fp = ''
+        self.save_question_data()
+        self.refresh_answer_summary()
+
+    def clear_question(self):
+        self.question_text.delete('1.0', tk.END)
+        self.question_img_path = ''
+        self._editor_changed()
+
+    def clear_guide(self):
+        self.guide_text.delete('1.0', tk.END)
+        self.grading_guide = ''
+        self.guide_fp = ''
+        self._editor_changed()
+
+    def _question_img_file(self):
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        qnum = re.sub(r'[^0-9A-Za-z_-]', '_', self.question_num_entry.get().strip() or "x")
+        folder = os.path.join(app_dir, "question_images")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"q{qnum}.png")
+
+    def capture_question(self):
+        """截原题：保存截图（生成指南要用），并转写成统一格式的文字。"""
+        editor_open = self.editor.winfo_viewable()
+        self.editor.withdraw()
+        self.root.iconify()
+        time.sleep(0.3)
+
+        def on_captured(region):
+            x, y, w, h = region
+            img = pyautogui.screenshot(region=(x, y, w, h))
+            self.root.deiconify()
+            self.open_answer_editor() if editor_open else None
+            try:
+                path = self._question_img_file()
+                img.save(path)
+                self.question_img_path = path
+            except Exception as e:
+                self.log(f"⚠ 原题截图保存失败：{e}")
+            self.log("正在识别原题...")
+
+            def worker():
+                try:
+                    text = self.call_ai_api(gc.capture_prompt("question"), img, need_json=False,
+                                            timeout=PREP_TIMEOUT).strip()
+
+                    def fill():
+                        self.question_text.delete('1.0', tk.END)
+                        self.question_text.insert('1.0', text)
+                        self._editor_changed()
+                        self.log("✓ 原题已识别（请核对一遍）")
+                    self.ui(fill)
+                except Exception as e:
+                    err = str(e)
+                    self.log(f"⚠ 原题识别失败: {err}")
+                    self.ui(lambda: messagebox.showerror("错误", f"原题识别失败：{err}"))
+            threading.Thread(target=worker, daemon=True).start()
+
+        selector = ScreenshotSelector(on_captured)
+        selector.start()
+
+    def generate_guide(self):
+        """原题截图 + 参考答案 + 给分点 → 一次调用 → 统一格式的参考答案 + 批改指南，先预览再确认。"""
+        answer = self.answer_text.get('1.0', tk.END).strip()
+        rubric = self.rubric_text.get('1.0', tk.END).strip()
+        question = self._question_now()
+        mx = self._current_max_score()
+        if not answer:
+            messagebox.showinfo("生成指南", "请先填参考答案。", parent=self.editor)
+            return
+        if not mx:
+            messagebox.showinfo("生成指南", "请先在主窗口填满分。", parent=self.editor)
+            return
+        img = None
+        if self.question_img_path and os.path.isfile(self.question_img_path):
+            try:
+                img = Image.open(self.question_img_path).convert("RGB")
+            except Exception:
+                img = None
+        if img is None:
+            messagebox.showinfo("生成指南", "请先点「截原题」截一张原题（模型要看着题目写指南）。",
+                                parent=self.editor)
+            return
+        qnum = self.question_num_entry.get().strip()
+        prompt = gc.build_guide_prompt(qnum, mx, question, answer, rubric)
+        self.log("正在生成批改指南（只做一次，约 20–60 秒）...")
+        self.guide_status.config(text="⏳ 生成中…", fg=self.THEME['sub'])
+
+        def worker():
+            try:
+                t0 = time.time()
+                text = self.call_ai_api(prompt, img, need_json=False, timeout=PREP_TIMEOUT)
+                new_answer, guide = gc.parse_guide_output(text)
+                self.log(f"✓ 指南已生成（{time.time() - t0:.0f}s），请在预览里确认")
+                self.ui(lambda: self._guide_preview(answer, rubric, new_answer, guide, mx))
+            except Exception as e:
+                err = str(e)
+                self.log(f"⚠ 生成指南失败: {err}")
+                self.ui(lambda: (messagebox.showerror("错误", f"生成指南失败：{err}", parent=self.editor),
+                                 self.refresh_answer_summary()))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _guide_preview(self, old_answer, rubric, new_answer, guide, mx):
+        """预览：左边整理后的参考答案，右边批改指南。老师确认后才生效。"""
+        T, F = self.THEME, self.FONT
+        if not guide and not new_answer:
+            messagebox.showerror("生成指南", "模型没有按格式返回内容，请再点一次「生成指南」。", parent=self.editor)
+            self.refresh_answer_summary()
+            return
+        same, msg = gc.check_scores_kept(old_answer, new_answer) if new_answer else (False, "模型没有返回整理后的答案")
+        extra = gc.guide_new_scores(guide, [old_answer, rubric], mx)
+
+        win = tk.Toplevel(self.editor)
+        win.title("确认：统一格式的参考答案 + 批改指南")
+        win.configure(bg=T['bg'])
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"{min(1150, int(sw * 0.8))}x{min(820, int(sh * 0.85))}")
+        win.transient(self.editor)
+        win.attributes('-topmost', True)
+
+        top = tk.Frame(win, bg=T['bg'], padx=12, pady=8)
+        top.pack(fill=tk.X)
+        tk.Label(top, text=("✓ " if same else "✗ ") + msg, font=(F, 10, 'bold'), bg=T['bg'],
+                 fg=T['ok'] if same else T['danger'], anchor='w').pack(fill=tk.X)
+        if not same:
+            tk.Label(top, text="分值对不上时默认不替换参考答案，只用指南；你核对后也可以勾选替换。",
+                     font=(F, 9), bg=T['bg'], fg=T['sub'], anchor='w').pack(fill=tk.X)
+        if extra:
+            tk.Label(top, text="⚠ 指南里出现了标准里没有的分值："
+                     + "、".join(f"{fmt_score(x)}分" for x in extra) + "，请删掉或改正",
+                     font=(F, 9, 'bold'), bg=T['bg'], fg=T['danger'], anchor='w').pack(fill=tk.X)
+
+        mid = tk.Frame(win, bg=T['bg'], padx=12)
+        mid.pack(fill=tk.BOTH, expand=True)
+        mid.grid_columnconfigure(0, weight=1, uniform='pv')
+        mid.grid_columnconfigure(1, weight=1, uniform='pv')
+        mid.grid_rowconfigure(1, weight=1)
+        boxes = []
+        for col, (title, content) in enumerate((("整理后的参考答案（可改）", new_answer),
+                                                ("批改指南（可改）", guide))):
+            tk.Label(mid, text=title, font=(F, 10, 'bold'), bg=T['bg'], fg=T['teal_d'] if col == 0 else T['orange'],
+                     anchor='w').grid(row=0, column=col, sticky='w', padx=(0, 8) if col == 0 else 0)
+            box = scrolledtext.ScrolledText(mid, font=(F, 11), wrap=tk.WORD, relief=tk.FLAT, bg=T['input'],
+                                            fg=T['text'], highlightthickness=1, highlightbackground=T['line'],
+                                            padx=8, pady=6, undo=True)
+            box.grid(row=1, column=col, sticky='nsew', padx=(0, 8) if col == 0 else 0)
+            box.insert('1.0', content or "")
+            boxes.append(box)
+
+        bottom = tk.Frame(win, bg=T['bg'], padx=12, pady=10)
+        bottom.pack(fill=tk.X)
+        replace_var = tk.BooleanVar(value=bool(same and new_answer))
+        tk.Checkbutton(bottom, text="用整理后的答案替换原参考答案（替换后在答案框里按 Ctrl+Z 可撤销）",
+                       variable=replace_var, bg=T['bg'], font=(F, 9),
+                       state=tk.NORMAL if new_answer else tk.DISABLED).pack(side=tk.LEFT)
+
+        def confirm():
+            final_answer = boxes[0].get('1.0', tk.END).strip()
+            final_guide = boxes[1].get('1.0', tk.END).strip()
+            if replace_var.get() and final_answer:
+                ok, why = gc.check_scores_kept(old_answer, final_answer)
+                if not ok and not messagebox.askyesno(
+                        "分值核对", why + "\n\n仍然替换参考答案吗？", parent=win):
+                    return
+                self.answer_text.edit_separator()
+                self.answer_text.delete('1.0', tk.END)
+                self.answer_text.insert('1.0', final_answer)
+                self.answer_text.edit_separator()
+            self.guide_text.delete('1.0', tk.END)
+            self.guide_text.insert('1.0', final_guide)
+            self.grading_guide = final_guide
+            self.guide_fp = self._current_guide_fp() if final_guide else ''
+            self._card_logged = None
+            self.save_config()
+            self.refresh_answer_summary()
+            self.log("✓ 批改指南已确认" + ("，参考答案已换成统一格式" if replace_var.get() else ""))
+            win.destroy()
+
+        for text, cmd, solid in (("取消", win.destroy, False), ("确认使用", confirm, True)):
+            slot = tk.Frame(bottom, bg=T['bg'], width=100, height=30)
+            slot.pack_propagate(False)
+            slot.pack(side=tk.RIGHT, padx=(8, 0))
+            if solid:
+                b = self._btn(slot, text, cmd, T['teal'], active=T['teal_d'], bold=True)
+            else:
+                b = self._btn(slot, text, cmd, T['teal_bg'], fg=T['teal_d'], active='#C3FAE8')
+            b.pack(fill=tk.BOTH, expand=True)
+        self.refresh_answer_summary()
+
+    def active_guide(self):
+        """批改时用：(原题文字, 指南)。指南过期就不用，并提醒一次。"""
+        question = self._question_now()
+        state, _ = self.guide_state()
+        if state == 'ok':
+            return question, self._guide_now()
+        if state == 'stale' and getattr(self, '_stale_warned', None) != self.guide_fp:
+            self._stale_warned = self.guide_fp
+            self.log("  ⚠ 批改指南已过期（原题/答案/给分点改过），本次不用指南；请在编辑窗口重新生成")
+        return question, ""
 
     # ---------- 评分卡 ----------
     def _current_max_score(self):
@@ -2624,6 +2885,11 @@ class SimpleGradingUI:
             line2 += f" · 零分规则{len(rules['zero_rules'])}条"
         if rules["notes"]:
             line2 += f" · 说明{len(rules['notes'])}条"
+        if hasattr(self, 'guide_text'):
+            g_state, g_msg = self.guide_state()
+            line2 += {"ok": " · 批改指南✓", "stale": " · 指南已过期", "none": ""}[g_state]
+            self.guide_status.config(text=g_msg, fg={"ok": T['ok'], "stale": T['danger'],
+                                                     "none": T['sub']}[g_state])
         self.answer_summary.config(text=line1 + "\n" + line2, fg=T['text'] if (ans and ok) else T['danger'])
         if hasattr(self, 'editor_title'):
             q = self.question_num_entry.get().strip() or "?"
@@ -2799,6 +3065,12 @@ class SimpleGradingUI:
         if self.saved_rubric:
             self.rubric_text.delete('1.0', tk.END)
             self.rubric_text.insert('1.0', self.saved_rubric)
+        if self.saved_question_text:
+            self.question_text.delete('1.0', tk.END)
+            self.question_text.insert('1.0', self.saved_question_text)
+        if self.grading_guide:
+            self.guide_text.delete('1.0', tk.END)
+            self.guide_text.insert('1.0', self.grading_guide)
         self.half_var.set(self.half_point)
         self.refresh_answer_summary()
             
@@ -2883,9 +3155,8 @@ class SimpleGradingUI:
 
             def worker():
                 try:
-                    prompt = ("请把图片中的参考答案和评分标准原样转写成文字。数学式用常见写法或 LaTeX，"
-                              "保留每一步后面标注的分值（如“（2分）”），不要添加任何说明。")
-                    text = self.call_ai_api(prompt, img, need_json=False).strip()
+                    prompt = gc.capture_prompt("answer")
+                    text = self.call_ai_api(prompt, img, need_json=False, timeout=PREP_TIMEOUT).strip()
 
                     def fill():
                         cur = self.answer_text.get('1.0', tk.END).strip()
@@ -3124,8 +3395,12 @@ class SimpleGradingUI:
                 self.log(f"  ⚪ 空白卷，直接记 0 分（墨迹 {ink:.4f}）")
             else:
                 card = self.current_grading_card(standard_answer, question_num, max_score_f)
+                question_text, guide = self.active_guide()
+                if guide and getattr(self, '_guide_logged', None) != self.guide_fp:
+                    self._guide_logged = self.guide_fp
+                    self.log("  📘 本题使用老师确认过的批改指南")
                 prompt = gc.build_prompt(question_num, max_score, standard_answer, card,
-                                         self.half_point)
+                                         self.half_point, question_text, guide)
                 # 一份答卷只调用一次模型；JSON 解析失败直接报错交给老师，不重试
                 api_start = time.time()
                 try:
@@ -3308,6 +3583,8 @@ class SimpleGradingUI:
                 "model_total": float(model_score),
                 "answer": self.answer_text.get('1.0', tk.END).strip(),
                 "rubric": self.rubric_text.get('1.0', tk.END).strip(),
+                "question": self._question_now(),
+                "guide": self.active_guide()[1],
                 "model_items": [{k: it.get(k) for k in ("point_id", "point", "full", "got", "reason")}
                                 for it in items],
                 "model": getattr(self, '_last_model_used', None) or self.config.get('model_name', ''),
@@ -3337,17 +3614,19 @@ class SimpleGradingUI:
         """REST 直连，不再依赖已停止维护的 google.generativeai SDK。"""
         self.model = None
 
-    def call_ai_api(self, prompt, image, need_json=True):
+    def call_ai_api(self, prompt, image, need_json=True, timeout=None):
         """调用当前选定的提供商和模型。
 
         不再自动换模型：同一批卷子必须由同一个模型批，评分尺度才一致。
-        额度用尽、网络出错时直接报错并停下，由老师决定是否换模型。"""
+        额度用尽、网络出错时直接报错并停下，由老师决定是否换模型。
+        timeout：默认用批改上限 GRADE_TIMEOUT；备课时（生成指南、识别）可放宽。"""
+        self._timeout_now = timeout or GRADE_TIMEOUT
         try:
             return self._call_ai_api_once(prompt, image, need_json)
         except Exception as e:
             m = str(e).lower()
             if 'timed out' in m or 'timeout' in m or '超过' in m:
-                raise Exception(f"单题超过 {GRADE_TIMEOUT} 秒，已中止（请检查网络或模型是否开了思考）") from e
+                raise Exception(f"超过 {self._timeout_now} 秒，已中止（请检查网络或模型是否开了思考）") from e
             raise
 
 
@@ -3368,7 +3647,8 @@ class SimpleGradingUI:
         data.update(no_think_params(model, base_url))
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
         url = f"{base_url.rstrip('/')}/chat/completions"
-        text = post_chat_stream(url, data, headers, log=self.log, timeout=GRADE_TIMEOUT)
+        text = post_chat_stream(url, data, headers, log=self.log,
+                                timeout=getattr(self, '_timeout_now', GRADE_TIMEOUT))
         return self.parse_json_result(text) if need_json else text
         
     def _call_ai_api_once(self, prompt, image, need_json=True):
@@ -3420,7 +3700,7 @@ class SimpleGradingUI:
                 last_err = None
                 for attempt in range(3):
                     try:
-                        text, usage = gemini_request_raw(api_key, model_name, body, GRADE_TIMEOUT)
+                        text, usage = gemini_request_raw(api_key, model_name, body, getattr(self, '_timeout_now', GRADE_TIMEOUT))
                         self._last_model_used = f"Gemini/{model_name or 'gemini-2.5-flash'}"
                         return self.parse_json_result(text) if need_json else text
                     except urllib.error.HTTPError as e:
@@ -3442,7 +3722,7 @@ class SimpleGradingUI:
                 k = alive[tried % len(alive)]
                 tried += 1
                 try:
-                    text, usage = gemini_request_raw(k, model_name, body, GRADE_TIMEOUT)
+                    text, usage = gemini_request_raw(k, model_name, body, getattr(self, '_timeout_now', GRADE_TIMEOUT))
                     self._last_model_used = f"Gemini/{model_name or 'gemini-2.5-flash'}"
                     self.log(f"  [key池] 本次使用 #{(kp.get('pool',[]).index(k)+1) if k in kp.get('pool',[]) else '?'} 号key")
                     return self.parse_json_result(text) if need_json else text
@@ -4421,6 +4701,10 @@ class SimpleGradingUI:
                 'answer': self.saved_answer,
                 'rubric': self.saved_rubric,
                 'rubric_card': getattr(self, 'rubric_card', None),
+                'question_text': self._question_now(),
+                'question_img_path': self.question_img_path,
+                'grading_guide': self._guide_now(),
+                'guide_fp': self.guide_fp,
                 'half_point': self.half_point,
                 'blank_threshold': self.blank_threshold,
                 'grade_samples': getattr(self, 'grade_samples', 0),
@@ -4460,6 +4744,10 @@ class SimpleGradingUI:
                 self.saved_answer = config.get('answer', '')
                 self.saved_rubric = config.get('rubric', '')
                 self.rubric_card = config.get('rubric_card') or None
+                self.saved_question_text = config.get('question_text', '') or ''
+                self.question_img_path = config.get('question_img_path', '') or ''
+                self.grading_guide = config.get('grading_guide', '') or ''
+                self.guide_fp = config.get('guide_fp', '') or ''
                 if self.rubric_card:
                     try:
                         saved_mx = float(self.saved_max_score)

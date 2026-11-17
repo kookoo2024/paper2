@@ -1,11 +1,11 @@
 {
-  "version": "1.11.0",
-  "notes": "判分逻辑重写：通用提示词一次调用；程序只做算术不改判（四舍五入、不再自动改0）；去掉针对单题的硬编码；一批固定一个模型不自动切换；老师改分自动存为评测用例",
+  "version": "1.12.0",
+  "notes": "新增原题+批改指南：截原题后AI一次生成统一格式的参考答案和每个得分步骤的批改指南，程序核对分值不变，老师确认后批改时一起发给模型（仍一次请求）；截图识别统一输出 LaTeX 格式；指南随原题/答案/给分点变动自动过期",
   "files": {
-    "zhixue_simple.py": "2bee14f53263259a0ab8b296b48ada734a79fbc3ab398065ea403583eb4e7123",
-    "grading_core.py": "349941c5f1521955fa459b0538680a57c2746e59d388cba3dca9d40e52fb8851",
-    "README.md": "01e16a2065116a8d23f39495a2f305a033b5561d76cb52d476c174ac0dfb974c",
+    "zhixue_simple.py": "f8fb8456db79b50f9a588cb5fb46fe79a077d4b020906aef1f42f19c1dc2e6b6",
+    "grading_core.py": "54a586591a246b8bd593fc863097680f831084129550b12943117cae97933349",
+    "README.md": "2323b413ecd169469bf0c5751f75833f3f55648aa54e533d00bcda8d0e8506e8",
     "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3",
-    "eval.py": "66b0d06b57798a6a60e2a687aa078d206ae6aa7a9d15abb052dd6c7661961fae"
+    "eval.py": "6916dd5ff23ba3591f60be84d0e901a956493d17b562231ce7a387c121a2d675"
   }
 }

@@ -114,7 +114,10 @@ def build_case(case_dir, base_config, use_card=True):
             raise ValueError("没有 items 时必须提供 expected_total")
         expected_total = float(expected["expected_total"])
 
-    prompt = z.gc.build_prompt(question_num, max_score, answer, card, half_point)
+    # 原题/指南只取用例自己存的，避免把别的题的指南套过来
+    question = text_value(expected.get("question"), "")
+    guide = text_value(expected.get("guide"), "")
+    prompt = z.gc.build_prompt(question_num, max_score, answer, card, half_point, question, guide)
     return {
         "name": Path(case_dir).name,
         "dir": Path(case_dir),

@@ -12,6 +12,7 @@
 """
 
 import math
+import re
 
 # 评分卡结构（由 zhixue_simple.build_rubric_card 生成，老师可在评分卡窗口修改）：
 # card = {"parts": [{"id": "1", "title": "...", "max_score": 6,
@@ -116,6 +117,116 @@ def single_part_card(points, max_score):
     }
 
 
+
+# ---------------------------------------------------------------- 统一格式 / 批改指南（v1.12）
+
+# 参考答案、原题的统一书写格式。截图识别、整理格式都按这个要求输出。
+FORMAT_SPEC = """【统一格式】
+1. 文字用中文；所有数学式、字母、数字式子一律写成 LaTeX，并用 $...$ 包起来，例如 $\\frac{1}{2}$、$\\sqrt{3}$、$\\vec{AB}$、$x^2+y^2=1$。不要用 Unicode 上下标或 √、½ 这类符号。
+2. 小问单独起一行，写成（1）（2）（3）。
+3. 每个得分步骤单独一行，分值写在行尾，写成“（N分）”，N 是这一步自己的分值。
+4. 有多种解法时，单独一行写“解法二：”“解法三：”。
+5. 评分说明放在最后，单独一行写“评分说明：”，下面每条一行。
+6. 原文的内容、式子、分值一个都不能改、不能删、不能补；看不清的写【?】。"""
+
+
+def capture_prompt(kind="answer"):
+    """截图识别的提示词：原题 / 参考答案。"""
+    if kind == "question":
+        head = "请把图片中的数学题目原样转写成文字（只转写题目，不要解答）。"
+    else:
+        head = "请把图片中的参考答案和评分标准原样转写成文字，保留每一步标注的分值。"
+    return head + "\n" + FORMAT_SPEC + "\n只输出转写结果，不要任何说明。"
+
+
+def build_guide_prompt(question_num, max_score, question_text, standard_answer, rubric_text=""):
+    """生成「统一格式的参考答案 + 批改指南」。只在备课时调用一次，图片是原题截图。"""
+    rubric_block = f"\n【给分点（老师填写）】\n{rubric_text.strip()}\n" if rubric_text.strip() else ""
+    q_block = f"\n【原题文字】\n{question_text.strip()}\n" if question_text.strip() else ""
+    return f"""你是高中数学阅卷组长。图片是第{question_num}题的原题（满分{fmt(max_score)}分）。下面是老师给的参考答案和评分标准。请做两件事。
+{q_block}
+【参考答案（老师提供）】
+{standard_answer.strip()}
+{rubric_block}
+任务一：把参考答案整理成统一格式。只改写法和排版，内容、式子、步骤、分值一个都不能改、不能删、不能补。
+{FORMAT_SPEC}
+
+任务二：写一份批改指南，告诉阅卷老师每个得分步骤到底看什么。按参考答案的得分步骤顺序，每步一段，格式：
+【第几问 · 这一步要点的简短描述】
+必须看到：学生写出什么才给这一步的分（关键式子或结论）
+等价也对：哪些不同写法、不同设法、化简前的形式也算对
+部分给分：评分标准写了怎么扣就照写；没写就写“按评分标准”
+常见错误：看起来像对、其实不给分的写法（没有就写“无”）
+
+指南要求：
+- 不能出现任何新的分值，不能改分值，不能新增或合并得分步骤；分值只认参考答案和给分点。
+- 每段不超过 5 行，每行不超过 50 字；数学式同样用 $...$。
+- 只根据题目和参考答案写，不要编造评分标准里没有的扣分规则。
+
+严格按下面的格式输出，不要输出其他内容：
+===参考答案===
+（整理后的参考答案）
+===批改指南===
+（批改指南）"""
+
+
+def parse_guide_output(text):
+    """解析生成结果，返回 (answer, guide)。缺哪段就是空串。"""
+    text = (text or "").replace("\r\n", "\n")
+    text = re.sub(r"^```[a-zA-Z]*\n|\n```\s*$", "", text.strip())
+    m_a = re.search(r"={2,}\s*参考答案\s*={2,}", text)
+    m_g = re.search(r"={2,}\s*批改指南\s*={2,}", text)
+    answer = guide = ""
+    if m_a and m_g and m_a.start() < m_g.start():
+        answer = text[m_a.end():m_g.start()].strip()
+        guide = text[m_g.end():].strip()
+    elif m_g:
+        guide = text[m_g.end():].strip()
+    elif m_a:
+        answer = text[m_a.end():].strip()
+    return answer, guide
+
+
+_SCORE_RE = re.compile(r"(?<![0-9.])([0-9]+(?:\.[0-9]+)?)\s*分(?![析别类数母子钟])")
+
+
+def score_numbers(text):
+    """文本里所有“N分”的数字，排好序。用来核对整理前后分值没有变。"""
+    vals = []
+    for m in _SCORE_RE.finditer(text or ""):
+        try:
+            vals.append(float(m.group(1)))
+        except ValueError:
+            pass
+    return sorted(vals)
+
+
+def check_scores_kept(original, normalized):
+    """返回 (是否一致, 说明)。分值多了、少了、变了都算不一致。"""
+    a, b = score_numbers(original), score_numbers(normalized)
+    if a == b:
+        return True, f"分值核对一致（共 {len(a)} 处，合计 {fmt(sum(a))} 分）" if a else "原答案没有标分值，整理后也没有"
+    from collections import Counter
+    ca, cb = Counter(a), Counter(b)
+    lost = list((ca - cb).elements())
+    extra = list((cb - ca).elements())
+    parts = []
+    if lost:
+        parts.append("少了 " + "、".join(f"{fmt(x)}分" for x in lost))
+    if extra:
+        parts.append("多了 " + "、".join(f"{fmt(x)}分" for x in extra))
+    return False, "分值和原答案对不上：" + "；".join(parts)
+
+
+def guide_new_scores(guide, original_texts, max_score=None):
+    """指南里出现、但原答案/给分点里没有的分值（指南不应引入新分值）。"""
+    allowed = set()
+    for t in original_texts:
+        allowed.update(score_numbers(t))
+    if max_score:
+        allowed.add(float(max_score))
+    return sorted({x for x in score_numbers(guide) if x not in allowed})
+
 # ---------------------------------------------------------------- 提示词
 
 def _card_text(card):
@@ -165,9 +276,14 @@ def _rules_text(card):
     return out[:12]
 
 
-def build_prompt(question_num, max_score, standard_answer, card, half_point=False):
-    """通用判分提示词。不含任何具体题目的示例。"""
+def build_prompt(question_num, max_score, standard_answer, card, half_point=False,
+                 question_text="", guide=""):
+    """通用判分提示词。不含任何具体题目的示例。
+    question_text / guide：老师确认过的原题与批改指南，没有就不出现。"""
     unit = "0.5" if half_point else "1"
+    q_block = f"【原题】\n{question_text.strip()}\n\n" if (question_text or "").strip() else ""
+    guide_block = (f"\n【批改指南（老师确认过）：说明每个得分步骤看什么、哪些写法等价；分值仍以评分卡为准】\n{guide.strip()}\n"
+                   if (guide or "").strip() else "")
     rules = _rules_text(card)
     rules_block = ("\n【评分说明（老师写的，必须遵守）】\n" + "\n".join(f"- {r}" for r in rules)) if rules else ""
     example_parts = []
@@ -182,16 +298,16 @@ def build_prompt(question_num, max_score, standard_answer, card, half_point=Fals
 
     return f"""你是高中数学阅卷老师。图片是学生第{question_num}题的作答，满分{fmt(max_score)}分。请对照参考答案，按评分卡逐个采分点判分。
 
-【参考答案】
+{q_block}【参考答案】
 {standard_answer.strip()}
 
 【评分卡】（方括号里是采分点编号，后面是分值和要求）
 {_card_text(card)}{rules_block}
-
+{guide_block}
 【判分要求】
 1. 先看清学生写了什么，再判分。只依据图片里学生实际写出的内容，参考答案只用来对照，不能替学生补步骤。
 2. 每一问先选一套解法：选与学生思路最接近的那一套，只按这套的采分点判。学生用了评分卡没列的正确方法，也选最接近的一套，按"是否达到该点要求的数学结果"判，并把 alt_method 填 true。
-3. 采分点看数学实质，不看字面：学生写出了该点要求的式子、结论或步骤，或与它数学上等价的写法（变形、化简、换字母、换坐标系、不同但正确的推理），就给满分；没写、写错就给 0。
+3. 采分点看数学实质（有批改指南时，按指南里“必须看到/等价也对/常见错误”判断），不看字面：学生写出了该点要求的式子、结论或步骤，或与它数学上等价的写法（变形、化简、换字母、换坐标系、不同但正确的推理），就给满分；没写、写错就给 0。
 4. 只完成一部分：标准写了扣分办法就照办；没写就按完成的比例给分，分数是 {unit} 的整数倍，并在 reason 里说明缺了什么。
 5. 分档点只能给列出的分数：给学生完整达到的最高一档，一档都没达到给 0。
 6. 前面算错：错误那一步不给分；后面方法对、只是沿用了错误数据的过程点可以给分，结果点不给分。评分说明另有规定的，按评分说明。
