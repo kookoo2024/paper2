@@ -1,9 +1,10 @@
 {
-  "version": "1.7.4",
-  "notes": "v1.7.4：只判一次；严格按给分点，没看到得分点或等价表达一律0分；等价判定双向严格（等价必给、不等价必0）；取消逐份人工复核、默认直接提交；参考答案新增粘贴按钮",
+  "version": "1.10.1",
+  "notes": "v1.10.1：修复分档日志出现 sequence item 0 expected str instance int found；统一档位分数格式化并增加回归测试",
   "files": {
-    "zhixue_simple.py": "8a7cf31a4da6e1bff870d4d222a8ac1671702edfb357ed842f6ab1e85e7ddc78",
-    "README.md": "b5cf9526f480f5dd410d161704bbf0d864b69bb3112549109d027bbee4fa8446",
-    "requirements.txt": "f3eedb2916ec13628bdf4af5857fa0d46cad77cb2222ab334712ce02434c902a"
+    "zhixue_simple.py": "43d9922945502da5e9a3f55725020cd896880364fd5b6199656f7868a040ed27",
+    "README.md": "af3346ac925424104e13830c12f06d72222a43ff4f59596be9a0a703c19a6247",
+    "requirements.txt": "f3eedb2916ec13628bdf4af5857fa0d46cad77cb2222ab334712ce02434c902a",
+    "eval.py": "63109d18501d292286c102b8d759adefdf2c2d53ea14f9cf7abb7f9ce247df6a"
   }
 }
