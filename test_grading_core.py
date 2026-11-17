@@ -213,6 +213,48 @@ rp = gc.build_revise_prompt("18", 12, "原题Q", "答案A", "（1）满分 12 �
 check("意见修订提示词", all(k in rp for k in ("新意见1", "旧意见0", "答案A", "指南G", "===调整说明===", "2 张")))
 check("四段解析含调整说明", gc.parse_sections("===给分点===\nP\n===调整说明===\nN", ("参考答案", "给分点", "批改指南", "调整说明"))["调整说明"] == "N")
 
+# v1.14.2：多套解法不能加在一起和满分比
+multi = "（1）满分 6 分\n解法一：A\na｜6\n解法二：B\nb1｜3\nb2｜3\n解法三：C\nc｜6\n（2）满分 11 分\nx｜11"
+_, iss_m, _ = gc.card_from_points_text(multi, 17)
+check("三套解法各 6 分、满分 17 不报超分", not iss_m, str(iss_m))
+
+# v1.15.0：原卷存档
+import tempfile
+import paper_archive as pa
+from PIL import Image as _Img
+with tempfile.TemporaryDirectory() as td:
+    root = pa.archive_root(td)
+    spec = {"question_num": "18", "max_score": 17.0, "half_point": False, "answer": "A", "rubric": multi,
+            "question": "Q", "guide": "", "card": z.card_for_spec({"answer": "A", "rubric": multi,
+                                                                     "question_num": "18", "max_score": 17})}
+    bdir = pa.batch_dir(root, "18")
+    sid = pa.save_spec(bdir, spec)
+    check("同一版规范只存一次", pa.save_spec(bdir, dict(spec)) == sid and len(pa.load_specs(bdir)) == 1)
+    sid2 = pa.save_spec(bdir, dict(spec, guide="改过的指南"))
+    check("规范改了另存一版", sid2 != sid and len(pa.load_specs(bdir)) == 2)
+    img = _Img.new("RGB", (60, 40), "white")
+    n1 = pa.save_paper(bdir, img, {"spec": sid, "model_score": 12})
+    n2 = pa.save_paper(bdir, img, {"spec": sid, "model_score": 9})
+    n3 = pa.save_paper(bdir, img, {"spec": sid2, "model_score": 5})
+    check("卷子按顺序编号", (n1, n2, n3) == ("0001", "0002", "0003"))
+    pa.update_paper(bdir, n1, final_score=12, status="reviewed")
+    pa.update_paper(bdir, n2, final_score=10, status="changed")
+    pa.update_paper(bdir, n3, final_score=5, status="auto")
+    img.save(str(Path(bdir) / "my_scan.jpg"))   # 老师自己放的图
+    papers = {p["name"]: p for p in pa.list_papers(bdir)}
+    check("自己放的图片也能列出来", "my_scan" in papers and papers["my_scan"]["record"] == {})
+    check("标准分只认老师看过的", pa.reference(papers[n2]["record"]) == (10.0, "changed")
+          and pa.reference(papers["my_scan"]["record"]) == (None, None))
+    b0 = pa.list_batches(root)[0]
+    check("文件夹统计", b0["count"] == 4 and b0["reviewed"] == 2 and b0["specs"] == 2, str(b0))
+    st = pa.summarize([0, 1, -2])
+    check("统计：一致/±1/偏差", st["exact"] == 1 and st["within1"] == 2 and abs(st["bias"] + 1 / 3) < 1e-9)
+    check("存档评分卡直接用", z.card_for_spec(pa.load_specs(bdir)[sid]) == pa.load_specs(bdir)[sid]["card"])
+    import eval as ev
+    cs = ev.archive_cases(root, {})
+    check("eval --archive 只取老师看过的", sorted(c["name"].split("/")[1] for c in cs) == ["0001", "0002"]
+          and all(c["source"] == "存档评分卡" and c["trim"] for c in cs), str([c["name"] for c in cs]))
+
 print()
 print("全部通过" if not failures else f"{len(failures)} 项失败")
 sys.exit(1 if failures else 0)

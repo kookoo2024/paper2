@@ -1,12 +1,13 @@
 {
-  "version": "1.14.2",
-  "notes": "v1.14.2：修复——给分点里有多套解法时，开始批改前的核对把各套解法的分加在一起，误报“给分点合计超过满分”；现在按每套解法分别核对",
+  "version": "1.15.0",
+  "notes": "原卷存档与离线批改测试：存原卷开关打开后每份原卷连同当时的规范存在本机；顶栏「离线」按当时或现在的规范重批并和老师的分对比；可放自己的试卷并手填标准分",
   "files": {
-    "zhixue_simple.py": "af6485269dfc7ec04acbf232d311c97f81f4ffe9e9ed81726cc58be443bd14e5",
+    "zhixue_simple.py": "b463f58ccdc04a4761631791ec0ccaa6e202a439e97aaea5214d8514a77c7d11",
     "grading_core.py": "4aaa6f72c01a297fb90f6430ebd41c1226bb6913ab2b41b2d5e2baff1a2c959b",
-    "README.md": "5fed2fa92642941fcb67b204d5f395ff9bed7ceb91fc60e1821593c1c5b3ba43",
+    "README.md": "81c68322ee982f66a4ce11ae246218e6014d6338a2c066983b763ac3b478998e",
     "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3",
-    "eval.py": "6916dd5ff23ba3591f60be84d0e901a956493d17b562231ce7a387c121a2d675"
+    "eval.py": "bd4da5f569ec6a2bbf3b470da02e59f1559711c0ea215b189fdb66c23652476b",
+    "paper_archive.py": "d5be687f4fa394bd741ffffbd6543e0dda1adc55aa30a5b25bef514fed7a7fc7"
   },
-  "tag": "v1.14.2"
+  "tag": "v1.15.0"
 }

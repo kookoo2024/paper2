@@ -22,6 +22,10 @@ import urllib.error
 import io
 
 import grading_core as gc
+try:
+    import paper_archive as pa
+except Exception:   # 老版本更新时缺这个文件也能启动，只是没有原卷存档
+    pa = None
 
 HTTP_TIMEOUT = 120  # 兜底超时（秒）；批改调用会传更短的 15 秒目标
 GRADE_TIMEOUT = 20  # 单题批改硬上限：超过就中止
@@ -161,7 +165,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.14.2"
+APP_VERSION = "1.15.0"
 CARD_VERSION = 3
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
@@ -1381,6 +1385,27 @@ def points_text_card(answer_text, rubric_text, question_num, max_score):
     return card, []
 
 
+def card_for_spec(spec):
+    """离线测试用：按存档里的规范得到评分卡。存档里有当时的卡就直接用，保证和当时一模一样。"""
+    card = spec.get("card")
+    if isinstance(card, dict) and card.get("parts"):
+        return card
+    answer = str(spec.get("answer") or "")
+    rubric = str(spec.get("rubric") or "")
+    qnum = str(spec.get("question_num") or "")
+    mx = float(spec.get("max_score") or 0)
+    if gc.is_points_text(rubric):
+        card, issues = points_text_card(answer, rubric, qnum, mx)
+        if issues:
+            raise Exception("给分点格式有问题：" + "；".join(issues[:3]))
+        return card
+    card = build_rubric_card(answer, rubric, qnum, mx)
+    if card and not validate_rubric_card(card, mx):
+        return card
+    points, _src, _rules = resolve_rubric_points(rubric, answer, mx)
+    return gc.single_part_card(points, mx)
+
+
 def build_rubric_card(answer_text, rubric_text, question_num, max_score):
     """把评分标准整理成 v2 评分卡：小问 → 多套解法 → 采分点。"""
     if gc.is_points_text(rubric_text):
@@ -1797,6 +1822,10 @@ class SimpleGradingUI:
         self.saved_rubric = ""        # 给分点（每行：要点｜分值）
         self.half_point = False       # 是否允许 0.5 分
         self.blank_threshold = 0.0015 # 墨迹占比低于此值视为空白卷
+        self.keep_archive = True      # 存原卷（离线批改测试用）
+        self.offline_running = False
+        self._archive_ref = None
+        self._pending_archive = None
         self.grade_samples = 1        # 已废弃：固定单次判分（字段保留兼容旧配置）
         self.keep_topmost = True      # 是否置顶（批改时可自动临时取消）
         
@@ -2632,6 +2661,7 @@ class SimpleGradingUI:
                                       T['head2'], 'white', T['head_a'], width=42)
         self._small(tools, "笔记", self.setup_obsidian_path, T['head2'], 'white', T['head_a'], padx=4, width=42)
         self._small(tools, "模型", self.setup_model, T['head2'], 'white', T['head_a'], width=42)
+        self._small(tools, "离线", self.open_offline_test, T['head2'], 'white', T['head_a'], width=42)
 
         # ===== 底部状态栏 =====
         status = tk.Frame(self.root, bg=T['head'], height=22)
@@ -2705,7 +2735,7 @@ class SimpleGradingUI:
         self.grade_btn.pack(fill=tk.BOTH, expand=True)
 
         r = self._row(body)
-        for i in range(3):
+        for i in range(4):
             r.grid_columnconfigure(i, weight=1, uniform='ck')
         r.grid_rowconfigure(0, weight=1)
         ck = dict(font=(F, 8), bg=T['card'], fg=T['text'], activebackground=T['card'],
@@ -2717,6 +2747,9 @@ class SimpleGradingUI:
         self.skip_confirm_var = tk.BooleanVar(value=True)
         tk.Checkbutton(r, text="跳过确认", variable=self.skip_confirm_var, command=self.save_config,
                        **dict(ck, fg=T['warn'])).grid(row=0, column=2, sticky='w')
+        self.keep_archive_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(r, text="存原卷", variable=self.keep_archive_var, command=self.on_archive_toggle,
+                       **ck).grid(row=0, column=3, sticky='w')
 
         r = self._row(body, gap=0)
         self._label(r, "间隔").pack(side=tk.LEFT)
@@ -2789,6 +2822,8 @@ class SimpleGradingUI:
             self.auto_click_var.set(self.saved_auto_click)
         if hasattr(self, 'skip_confirm_var'):
             self.skip_confirm_var.set(getattr(self, 'saved_skip_confirm', True))
+        if hasattr(self, 'keep_archive_var'):
+            self.keep_archive_var.set(getattr(self, 'keep_archive', True))
         
         # 3. 延时设置
         if self.saved_delay and hasattr(self, 'delay_entry'):
@@ -2955,6 +2990,9 @@ class SimpleGradingUI:
         if self.is_grading:
             self.log("⚠ 正在批改中，请稍候...")
             return
+        if getattr(self, 'offline_running', False):
+            self.log("⚠ 离线测试正在跑，先在离线窗口里停下")
+            return
         
         if not self.answer_region:
             messagebox.showwarning("提示", "请先设置答案区域")
@@ -3114,6 +3152,7 @@ class SimpleGradingUI:
             # 空白卷直接 0 分，不浪费 API 额度
             api_elapsed = 0.0
             needs_review = False
+            spec_card = None
             if ink < self.blank_threshold:
                 result = {
                     "score": 0, "items": [], "blank": True, "confidence": "高",
@@ -3124,6 +3163,7 @@ class SimpleGradingUI:
                 self.log(f"  ⚪ 空白卷，直接记 0 分（墨迹 {ink:.4f}）")
             else:
                 card = self.current_grading_card(standard_answer, question_num, max_score_f)
+                spec_card = card
                 question_text, guide = self.active_guide()
                 if guide and getattr(self, '_guide_logged', None) != self.guide_fp:
                     self._guide_logged = self.guide_fp
@@ -3163,6 +3203,21 @@ class SimpleGradingUI:
                     self.api_times.append(api_elapsed)
 
             model_name = getattr(self, '_last_model_used', None) or self.config.get('model_name', 'Unknown')
+            # 原卷存档：记下这份用的原图和当时的规范，出结果后一起存
+            self._pending_archive = None
+            if pa and self.keep_archive:
+                try:
+                    q_now, g_now = self.active_guide()
+                    self._pending_archive = {
+                        "image": student_img,
+                        "spec": {"question_num": question_num, "max_score": max_score_f,
+                                 "half_point": bool(self.half_point), "answer": standard_answer,
+                                 "rubric": self.rubric_text.get('1.0', tk.END).strip(),
+                                 "question": q_now, "guide": g_now, "card": spec_card},
+                        "api_elapsed": round(api_elapsed, 2),
+                    }
+                except Exception as e:
+                    self.log(f"  ⚠ 原卷存档准备失败：{e}")
             self.root.after(0, lambda: self.display_result(result, max_score, elapsed, model_name))
             
         except Exception as e:
@@ -3279,6 +3334,7 @@ class SimpleGradingUI:
         self.update_stats()
         avg_time = self.avg_grade_time()
         self._record = (result, max_score, model_name, elapsed, avg_time)
+        self.archive_current(result, model_name, elapsed)
 
         self.waiting_for_confirm = True
         self.pending_score = score
@@ -3324,6 +3380,462 @@ class SimpleGradingUI:
             self.log(f"  💾 已存为评测用例：eval_cases/corrections/q{qnum}_{stamp}")
         except Exception as e:
             self.log(f"  ⚠ 保存评测用例失败：{e}")
+
+    # ---------- 原卷存档 / 离线批改测试（v1.15） ----------
+    def on_archive_toggle(self):
+        self.keep_archive = bool(self.keep_archive_var.get())
+        self.save_config()
+        self.log("💾 存原卷：已打开，开关不关，之后批的每份都会存" if self.keep_archive
+                 else "💾 存原卷：已关闭")
+
+    def _archive_root(self):
+        return pa.archive_root(os.path.dirname(os.path.abspath(__file__)))
+
+    def archive_current(self, result, model_name, elapsed):
+        """出结果时先把原卷和程序分存下；最终分等老师确认/提交时再补上。"""
+        self._archive_ref = None
+        pend = getattr(self, '_pending_archive', None)
+        self._pending_archive = None
+        if not (pa and pend and getattr(self, 'keep_archive', True)):
+            return
+        try:
+            spec = pend["spec"]
+            bdir = pa.batch_dir(self._archive_root(), spec.get("question_num"))
+            sid = pa.save_spec(bdir, spec)
+            items = result.get('items') or []
+            rec = {
+                "spec": sid,
+                "model_score": float(result.get('score', 0) or 0),
+                "final_score": None,
+                "status": "pending",
+                "blank": bool(result.get('blank')),
+                "model": model_name,
+                "elapsed": round(float(elapsed or 0), 2),
+                "api_elapsed": pend.get("api_elapsed"),
+                "analysis": str(result.get('analysis') or '')[:800],
+                "items": [{k: it.get(k) for k in ("point_id", "point", "full", "got", "reason")}
+                          for it in items],
+            }
+            name = pa.save_paper(bdir, pend["image"], rec)
+            self._archive_ref = (bdir, name)
+        except Exception as e:
+            self.log(f"  ⚠ 原卷存档失败：{e}")
+
+    def archive_finish(self, final_score, status):
+        ref = getattr(self, '_archive_ref', None)
+        self._archive_ref = None
+        if not (pa and ref):
+            return
+        try:
+            pa.update_paper(ref[0], ref[1], status=status,
+                            final_score=None if final_score is None else float(final_score))
+            self.log(f"  💾 原卷已存：{os.path.basename(ref[0])}/{ref[1]}.png")
+        except Exception as e:
+            self.log(f"  ⚠ 原卷存档失败：{e}")
+
+    def spec_now(self):
+        """编辑窗口里现在的规范（主线程调用）。"""
+        answer = self.answer_text.get('1.0', tk.END).strip()
+        qnum = self.question_num_entry.get().strip()
+        mx = self._current_max_score()
+        if not answer or mx <= 0:
+            raise Exception("编辑窗口里还没有参考答案或满分")
+        card = self.current_grading_card(answer, qnum, mx)
+        question, guide = self.active_guide()
+        return {"question_num": qnum, "max_score": mx, "half_point": bool(self.half_var.get()),
+                "answer": answer, "rubric": self.rubric_text.get('1.0', tk.END).strip(),
+                "question": question, "guide": guide, "card": card}
+
+    def grade_offline(self, img, spec, card, from_screen=True):
+        """离线重批一份：和正式批改同一个提示词、同一次请求、同一套程序核分，只是不截屏、不提交。"""
+        grade_img = trim_bottom_taskbar(img)[0] if from_screen else img
+        ink = ink_ratio(grade_img)
+        if ink < self.blank_threshold:
+            return {"score": 0, "items": [], "blank": True,
+                    "analysis": f"几乎是空白（墨迹 {ink:.4f}），按 0 分"}, 0.0
+        mx = float(spec.get("max_score") or 0)
+        mx_show = int(mx) if mx == int(mx) else mx
+        half = bool(spec.get("half_point"))
+        prompt = gc.build_prompt(str(spec.get("question_num") or ""), mx_show,
+                                 str(spec.get("answer") or ""), card, half,
+                                 str(spec.get("question") or ""), str(spec.get("guide") or ""))
+        t0 = time.time()
+        result = self.call_ai_api(prompt, grade_img, need_json=True)
+        api_elapsed = time.time() - t0
+        score, items, reasons, review = gc.settle(result, card, mx, half)
+        result.update(score=score, items=items, _reasons=reasons, _review=review)
+        return result, api_elapsed
+
+    @staticmethod
+    def _open_path(path):
+        try:
+            if hasattr(os, 'startfile'):
+                os.startfile(path)
+            else:
+                import subprocess
+                subprocess.Popen(['xdg-open', path])
+        except Exception as e:
+            messagebox.showerror("打不开", str(e))
+
+    def open_offline_test(self):
+        if pa is None:
+            messagebox.showerror("离线测试", "缺少 paper_archive.py，请点「更新」")
+            return
+        old = getattr(self, '_offline_win', None)
+        if old is not None and old.winfo_exists():
+            old.deiconify()
+            old.lift()
+            return
+        T, F = self.THEME, self.FONT
+        root_dir = self._archive_root()
+        os.makedirs(root_dir, exist_ok=True)
+        win = tk.Toplevel(self.root)
+        self._offline_win = win
+        win.title("离线批改测试（不连智学网、不提交分数）")
+        win.geometry("960x660")
+        win.minsize(780, 520)
+        win.configure(bg=T['bg'])
+        try:
+            win.attributes('-topmost', bool(self.keep_topmost))
+        except Exception:
+            pass
+
+        # ---- 左：存档列表 ----
+        left = tk.Frame(win, bg=T['bg'], padx=10, pady=10)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        tk.Label(left, text="存档（一天一题一个文件夹）", font=(F, 9, 'bold'), bg=T['bg'],
+                 fg=T['text']).pack(anchor='w')
+        batch_list = tk.Listbox(left, width=34, font=(F, 9), activestyle='none', exportselection=False,
+                                relief=tk.FLAT, highlightthickness=1, highlightbackground=T['line'])
+        batch_list.pack(fill=tk.Y, expand=True, pady=(4, 6))
+        lb = tk.Frame(left, bg=T['bg'])
+        lb.pack(fill=tk.X)
+        tk.Label(left, text="自己的试卷：点「新建」建个文件夹，把图片放进去，\n再点「刷新」；在右边选中一份可以「填标准分」。",
+                 font=(F, 8), bg=T['bg'], fg=T['sub'], justify=tk.LEFT).pack(anchor='w', pady=(6, 0))
+
+        # ---- 右：选项、结果 ----
+        right = tk.Frame(win, bg=T['bg'], padx=4, pady=10)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        opt = tk.Frame(right, bg=T['bg'])
+        opt.pack(fill=tk.X)
+        tk.Label(opt, text="按哪版规范批：", font=(F, 9), bg=T['bg'], fg=T['text']).pack(side=tk.LEFT)
+        mode = tk.StringVar(value='then')
+        for val, txt in (('then', "当时的规范"), ('now', "编辑窗口里现在的规范")):
+            tk.Radiobutton(opt, text=txt, value=val, variable=mode, font=(F, 9), bg=T['bg'],
+                           activebackground=T['bg'], selectcolor=T['card']).pack(side=tk.LEFT, padx=(0, 8))
+        only_ref = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt, text="只批有标准分的", variable=only_ref, font=(F, 9), bg=T['bg'],
+                       activebackground=T['bg'], selectcolor=T['card']).pack(side=tk.LEFT)
+
+        ctl = tk.Frame(right, bg=T['bg'])
+        ctl.pack(fill=tk.X, pady=(6, 6))
+        start_btn = tk.Button(ctl, text="▶ 开始重批", font=(F, 10, 'bold'), bg=T['primary'], fg='white',
+                              activebackground=T['primary_d'], activeforeground='white', relief=tk.FLAT,
+                              bd=0, padx=14, pady=3, cursor='hand2')
+        start_btn.pack(side=tk.LEFT)
+        stop_btn = tk.Button(ctl, text="■ 停止", font=(F, 10), bg=T['slate'], fg='white', relief=tk.FLAT,
+                             bd=0, padx=12, pady=3, state=tk.DISABLED, cursor='hand2')
+        stop_btn.pack(side=tk.LEFT, padx=(6, 10))
+        progress = tk.Label(ctl, text="", font=(F, 9), bg=T['bg'], fg=T['sub'])
+        progress.pack(side=tk.LEFT)
+        tk.Label(ctl, text=f"模型：{self.config.get('model_name', '') or '未设置'}（整批固定）",
+                 font=(F, 8), bg=T['bg'], fg=T['sub']).pack(side=tk.RIGHT)
+
+        cols = ("name", "ref", "src", "new", "diff", "sec")
+        tree = ttk.Treeview(right, columns=cols, show='headings', height=12, selectmode='browse')
+        for c, txt, w in (("name", "卷", 120), ("ref", "标准分", 70), ("src", "来源", 80),
+                          ("new", "重批", 70), ("diff", "差", 60), ("sec", "用时", 60)):
+            tree.heading(c, text=txt)
+            tree.column(c, width=w, anchor='center')
+        tree.tag_configure('bad', foreground=T['danger'])
+        tree.tag_configure('ok', foreground=T['ok'])
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        bot = tk.Frame(right, bg=T['bg'])
+        bot.pack(fill=tk.X, pady=(6, 4))
+        summary = tk.Label(right, text="", font=(F, 9), bg=T['bg'], fg=T['text'], justify=tk.LEFT,
+                           anchor='w', wraplength=640)
+        summary.pack(fill=tk.X)
+        detail = scrolledtext.ScrolledText(right, height=9, font=(F, 9), wrap=tk.WORD, relief=tk.FLAT,
+                                           highlightthickness=1, highlightbackground=T['line'])
+        detail.pack(fill=tk.BOTH, pady=(4, 0))
+
+        state = {"batches": [], "bdir": None, "rows": {}, "stop": False}
+
+        def fmt(v):
+            return "" if v is None else str(fmt_score(v))
+
+        def refresh_batches(select=None):
+            state["batches"] = pa.list_batches(root_dir)
+            batch_list.delete(0, tk.END)
+            for b in state["batches"]:
+                batch_list.insert(tk.END, f"{b['name']}   {b['count']}份（复核{b['reviewed']}）")
+            names = [b["name"] for b in state["batches"]]
+            idx = names.index(select) if select in names else (0 if names else None)
+            if idx is not None:
+                batch_list.selection_set(idx)
+                load_batch(state["batches"][idx]["path"])
+            else:
+                load_batch(None)
+
+        def load_batch(bdir):
+            state["bdir"] = bdir
+            state["rows"] = {}
+            tree.delete(*tree.get_children())
+            detail.delete('1.0', tk.END)
+            summary.config(text="")
+            if not bdir:
+                progress.config(text="还没有存档：勾选主窗口的「存原卷」后正常批改，或新建文件夹放自己的试卷")
+                return
+            papers = pa.list_papers(bdir)
+            for p in papers:
+                ref, st = pa.reference(p["record"])
+                iid = tree.insert('', tk.END, values=(p["name"], fmt(ref), pa.STATUS_TEXT.get(st, st or ""),
+                                                      "", "", ""))
+                state["rows"][iid] = dict(p, ref=ref, status=st, result=None)
+            n_spec = len(pa.load_specs(bdir))
+            progress.config(text=f"{len(papers)} 份，{n_spec} 版规范")
+
+        def row_text(row):
+            rec = row["record"] or {}
+            lines = [f"卷 {row['name']}    标准分 {fmt(row['ref']) or '无'}（{pa.STATUS_TEXT.get(row['status'], '')}）"]
+            if rec:
+                lines.append(f"当时：程序 {fmt(rec.get('model_score'))} 分 → 提交 {fmt(rec.get('final_score')) or '无'}"
+                             f"    模型 {rec.get('model', '')}    规范 {rec.get('spec', '无')}")
+                if rec.get("analysis"):
+                    lines.append("当时评语：" + str(rec["analysis"]))
+            res = row.get("result")
+            if res:
+                if res.get("_error"):
+                    lines.append("\n重批失败：" + res["_error"])
+                else:
+                    lines.append(f"\n重批：{fmt(res.get('score'))} 分")
+                    if res.get("analysis"):
+                        lines.append("评语：" + str(res["analysis"]))
+                    for it in res.get("items") or []:
+                        lines.append(f"  • {it.get('point', '')}  {fmt(it.get('got', 0))}/{fmt(it.get('full', 0))}"
+                                     f"  {str(it.get('reason', '') or '').strip()}")
+                    for r in res.get("_reasons") or []:
+                        lines.append(f"  ⚠ {r}")
+            return "\n".join(lines)
+
+        def on_select(_e=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            detail.delete('1.0', tk.END)
+            detail.insert('1.0', row_text(state["rows"][sel[0]]))
+
+        def on_batch(_e=None):
+            sel = batch_list.curselection()
+            if sel and not getattr(self, 'offline_running', False):
+                load_batch(state["batches"][sel[0]]["path"])
+
+        def open_image(_e=None):
+            sel = tree.selection()
+            if sel:
+                self._open_path(state["rows"][sel[0]]["image"])
+
+        def new_folder():
+            name = simpledialog.askstring("新建文件夹", "文件夹名（比如：期中18题样卷）：", parent=win)
+            if not name:
+                return
+            safe = re.sub(r'[\\/:*?"<>|]+', "_", name.strip()) or "我的试卷"
+            path = os.path.join(root_dir, safe)
+            os.makedirs(path, exist_ok=True)
+            refresh_batches(select=safe)
+            self._open_path(path)
+
+        def set_ref():
+            sel = tree.selection()
+            if not sel or not state["bdir"]:
+                messagebox.showinfo("填标准分", "先在列表里选中一份", parent=win)
+                return
+            row = state["rows"][sel[0]]
+            spec = pa.load_specs(state["bdir"]).get((row["record"] or {}).get("spec") or "")
+            mx = float((spec or {}).get("max_score") or self._current_max_score() or 100)
+            v = simpledialog.askfloat("填标准分", f"卷 {row['name']} 的正确分数（0～{fmt_score(mx)}）：",
+                                      parent=win, minvalue=0, maxvalue=mx,
+                                      initialvalue=row["ref"] if row["ref"] is not None else None)
+            if v is None:
+                return
+            row["record"] = pa.update_paper(state["bdir"], row["name"], final_score=float(v), status="manual")
+            row["ref"], row["status"] = float(v), "manual"
+            vals = list(tree.item(sel[0], 'values'))
+            vals[1], vals[2] = fmt(v), pa.STATUS_TEXT["manual"]
+            res = row.get("result")
+            if res and not res.get("_error"):
+                d = float(res.get("score", 0)) - float(v)
+                vals[4] = f"{d:+g}"
+            tree.item(sel[0], values=vals)
+            on_select()
+            show_summary()
+
+        def show_summary():
+            rev, auto, none = [], [], 0
+            for row in state["rows"].values():
+                res = row.get("result")
+                if not res or res.get("_error"):
+                    continue
+                if row["ref"] is None:
+                    none += 1
+                elif row["status"] in pa.REVIEWED:
+                    rev.append(float(res.get("score", 0)) - row["ref"])
+                else:
+                    auto.append(float(res.get("score", 0)) - row["ref"])
+            text = pa.summary_text(pa.summarize(rev), "和老师看过的分比")
+            if auto:
+                text += "\n" + pa.summary_text(pa.summarize(auto), "和未复核的分比（只看稳不稳）")
+            if none:
+                text += f"\n另有 {none} 份没有标准分，选中后可「填标准分」"
+            summary.config(text=text)
+
+        def set_row(iid, res, sec):
+            row = state["rows"].get(iid)
+            if row is None:
+                return
+            row["result"] = res
+            vals = list(tree.item(iid, 'values'))
+            if res.get("_error"):
+                vals[3], vals[4] = "失败", ""
+                tags = ('bad',)
+            else:
+                vals[3] = fmt(res.get("score"))
+                tags = ()
+                if row["ref"] is not None:
+                    d = float(res.get("score", 0)) - row["ref"]
+                    vals[4] = f"{d:+g}" if abs(d) >= 0.01 else "0"
+                    tags = ('bad',) if abs(d) > 1.01 else ('ok',) if abs(d) < 0.01 else ()
+            vals[5] = f"{sec:.1f}s"
+            tree.item(iid, values=vals, tags=tags)
+            if tree.selection() == (iid,):
+                on_select()
+
+        def write_report():
+            try:
+                import csv
+                path = os.path.join(state["bdir"], f"offline_{datetime.now():%Y%m%d_%H%M%S}.csv")
+                with open(path, "w", encoding="utf-8-sig", newline="") as fp:
+                    w = csv.writer(fp)
+                    w.writerow(["卷", "标准分", "来源", "重批", "差", "规范", "模型"])
+                    for row in state["rows"].values():
+                        res = row.get("result")
+                        if not res:
+                            continue
+                        new = "" if res.get("_error") else res.get("score")
+                        diff = "" if (new == "" or row["ref"] is None) else float(new) - row["ref"]
+                        w.writerow([row["name"], row["ref"] if row["ref"] is not None else "",
+                                    pa.STATUS_TEXT.get(row["status"], ""), new, diff,
+                                    res.get("_spec", ""), res.get("_model", "")])
+                return path
+            except Exception as e:
+                self.log(f"⚠ 离线测试报告保存失败：{e}")
+                return None
+
+        def finish(msg):
+            self.offline_running = False
+            start_btn.config(state=tk.NORMAL)
+            stop_btn.config(state=tk.DISABLED)
+            progress.config(text=msg)
+            show_summary()
+            path = write_report()
+            if path:
+                self.log(f"🧪 离线测试结果已存：{os.path.relpath(path, root_dir)}")
+
+        def start():
+            if self.is_grading or getattr(self, 'offline_running', False):
+                messagebox.showwarning("离线测试", "正在批改，先停下再测", parent=win)
+                return
+            bdir = state["bdir"]
+            if not bdir:
+                return
+            rows = [(iid, r) for iid, r in state["rows"].items() if not only_ref.get() or r["ref"] is not None]
+            if not rows:
+                messagebox.showinfo("离线测试", "没有要批的卷子", parent=win)
+                return
+            specs = pa.load_specs(bdir)
+            now_spec = None
+            need_now = mode.get() == 'now' or any((r["record"] or {}).get("spec") not in specs for _, r in rows)
+            if need_now:
+                try:
+                    now_spec = self.spec_now()
+                except Exception as e:
+                    messagebox.showerror("离线测试", f"现在的规范用不了：{e}", parent=win)
+                    return
+                if mode.get() == 'then':
+                    self.log("🧪 没有当时规范的卷子（自己放的），按编辑窗口里现在的规范批")
+            model = self.config.get('model_name', '')
+            self.log(f"\n🧪 离线测试 {os.path.basename(bdir)}：{len(rows)} 份，"
+                     f"{'当时的规范' if mode.get() == 'then' else '现在的规范'}，模型 {model}")
+            for iid, _r in rows:
+                vals = list(tree.item(iid, 'values'))
+                vals[3] = vals[4] = vals[5] = ""
+                tree.item(iid, values=vals, tags=())
+            state["stop"] = False
+            self.offline_running = True
+            start_btn.config(state=tk.DISABLED)
+            stop_btn.config(state=tk.NORMAL)
+            use_then = mode.get() == 'then'
+
+            def worker():
+                cards, fails, done = {}, 0, 0
+                for k, (iid, row) in enumerate(rows, 1):
+                    if state["stop"]:
+                        break
+                    self.ui(lambda k=k: progress.config(text=f"正在批第 {k}/{len(rows)} 份…"))
+                    sid = (row["record"] or {}).get("spec")
+                    if use_then and sid in specs:
+                        spec, key = specs[sid], sid
+                    else:
+                        spec, key = now_spec, "现在"
+                    t0 = time.time()
+                    try:
+                        if key not in cards:
+                            cards[key] = now_spec["card"] if key == "现在" else card_for_spec(spec)
+                        img = Image.open(row["image"]).convert("RGB")
+                        res, _api = self.grade_offline(img, spec, cards[key], from_screen=bool(row["record"]))
+                        res["_spec"], res["_model"] = key, getattr(self, '_last_model_used', None) or model
+                        fails = 0
+                    except Exception as e:
+                        res = {"_error": str(e), "_spec": key}
+                        fails += 1
+                    done = k
+                    sec = time.time() - t0
+                    self.ui(lambda iid=iid, res=res, sec=sec: set_row(iid, res, sec))
+                    if fails >= 3:
+                        self.ui(lambda e=res["_error"]: finish(f"连续 3 份失败，已停下：{e[:60]}"))
+                        return
+                msg = "已停止" if state["stop"] else "完成"
+                self.ui(lambda: finish(f"{msg}：批了 {done}/{len(rows)} 份"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def stop():
+            state["stop"] = True
+            progress.config(text="批完这一份就停…")
+
+        def on_close():
+            state["stop"] = True
+            self._offline_win = None
+            win.destroy()
+
+        for txt, cmd in (("刷新", lambda: refresh_batches(
+                os.path.basename(state["bdir"]) if state["bdir"] else None)),
+                         ("打开文件夹", lambda: self._open_path(state["bdir"] or root_dir)),
+                         ("新建", new_folder)):
+            tk.Button(lb, text=txt, command=cmd, font=(F, 9), relief=tk.FLAT, bg=T['card'], fg=T['text'],
+                      bd=0, padx=8, pady=2, cursor='hand2').pack(side=tk.LEFT, padx=(0, 4))
+        for txt, cmd in (("填标准分", set_ref), ("打开原卷", open_image)):
+            tk.Button(bot, text=txt, command=cmd, font=(F, 9), relief=tk.FLAT, bg=T['card'], fg=T['text'],
+                      bd=0, padx=10, pady=2, cursor='hand2').pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(bot, text="双击一行看原卷", font=(F, 8), bg=T['bg'], fg=T['sub']).pack(side=tk.LEFT)
+        start_btn.config(command=start)
+        stop_btn.config(command=stop)
+        batch_list.bind('<<ListboxSelect>>', on_batch)
+        tree.bind('<<TreeviewSelect>>', on_select)
+        tree.bind('<Double-1>', open_image)
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        refresh_batches()
 
     def _save_record(self):
         """在用户确认/改分后保存记录，保证 HTML/笔记里的分数是最终提交分。"""
@@ -3992,6 +4504,7 @@ class SimpleGradingUI:
         # 如果勾选了跳过确认，直接自动提交
         if self.skip_confirm_var.get() and not force:
             self.log(f"⚡ 跳过确认，直接提交分数: {score}")
+            self.archive_finish(score, "auto")
             self._save_record()
             self._raise_window()
             if self.auto_click_var.get():
@@ -4080,6 +4593,7 @@ class SimpleGradingUI:
             if final_score != score:
                 self.log(f"✏ 人工改分: {score} → {final_score}")
                 self.save_correction_case(score, final_score, max_score)
+            self.archive_finish(final_score, "changed" if final_score != score else "reviewed")
             self.pending_score = final_score
             if self._record:
                 self._record[0]['score'] = final_score
@@ -4104,6 +4618,7 @@ class SimpleGradingUI:
         
         def on_reject():
             """拒绝分数"""
+            self.archive_finish(None, "skipped")
             self._save_record()
             dialog.destroy()
             self._raise_window()
@@ -4453,6 +4968,8 @@ class SimpleGradingUI:
                 'grading_guide': self._guide_now(),
                 'guide_fp': self.guide_fp,
                 'half_point': self.half_point,
+                'keep_archive': bool(self.keep_archive_var.get()) if hasattr(self, 'keep_archive_var')
+                                else getattr(self, 'keep_archive', True),
                 'blank_threshold': self.blank_threshold,
                 'grade_samples': getattr(self, 'grade_samples', 0),
                 'keep_topmost': self.keep_topmost,
@@ -4505,6 +5022,7 @@ class SimpleGradingUI:
                     self.rubric_card = upgrade_rubric_card(
                         self.rubric_card, saved_mx)
                 self.half_point = bool(config.get('half_point', False))
+                self.keep_archive = bool(config.get('keep_archive', True))
                 self.blank_threshold = float(config.get('blank_threshold', 0.0015))
                 self.grade_samples = int(config.get('grade_samples', 0) or 0)
                 self.keep_topmost = bool(config.get('keep_topmost', True))

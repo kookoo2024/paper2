@@ -39,3 +39,6 @@ zhixue_simple_config1.json
 eval_cases/corrections/
 question_images/
 materials/
+
+# 原卷存档（含学生答卷，只在本机，供离线批改测试）
+paper_archive/

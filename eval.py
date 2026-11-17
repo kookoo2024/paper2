@@ -89,6 +89,32 @@ def build_case(case_dir, base_config, use_card=True):
     image_path = find_answer_image(case_dir)
     if image_path is None:
         raise ValueError("缺少答卷图片（answer.png / answer.jpg）")
+    return build_case_from(expected, image_path, Path(case_dir).name, case_dir, base_config, use_card)
+
+
+def archive_cases(archive_dir, base_config, use_card=True):
+    """原卷存档（paper_archive/）里老师看过分的卷子，按当时的规范变成用例。"""
+    import paper_archive as pa
+    cases = []
+    for b in pa.list_batches(str(archive_dir)):
+        specs = pa.load_specs(b["path"])
+        for p in pa.list_papers(b["path"]):
+            ref, st = pa.reference(p["record"])
+            spec = specs.get(p["record"].get("spec") or "")
+            if ref is None or st not in pa.REVIEWED or not spec:
+                continue
+            expected = dict(spec, expected_total=ref)
+            name = "{}/{}".format(b["name"], p["name"])
+            try:
+                case = build_case_from(expected, Path(p["image"]), name, b["path"], base_config, use_card)
+                case["trim"] = True   # 存档里是原始截图，和正式批改一样先裁任务栏
+                cases.append(case)
+            except Exception as exc:
+                print("[跳过] {}：{}".format(name, exc))
+    return cases
+
+
+def build_case_from(expected, image_path, name, case_dir, base_config, use_card=True):
 
     answer = text_value(expected.get("answer"), base_config.get("answer", ""))
     rubric = text_value(expected.get("rubric"), base_config.get("rubric", ""))
@@ -96,8 +122,18 @@ def build_case(case_dir, base_config, use_card=True):
     question_num = text_value(expected.get("question_num"), base_config.get("question_num", ""))
     half_point = bool(expected.get("half_point", base_config.get("half_point", False)))
 
-    card = z.build_rubric_card(answer, rubric, question_num, max_score) if use_card else None
-    if card and not z.validate_rubric_card(card, max_score):
+    saved = expected.get("card")
+    if use_card and isinstance(saved, dict) and saved.get("parts"):
+        card, source = saved, "存档评分卡"
+    elif use_card and z.gc.is_points_text(rubric):
+        card, source = z.card_for_spec(dict(expected, answer=answer, rubric=rubric,
+                                            question_num=question_num, max_score=max_score)), "给分点"
+    else:
+        card = z.build_rubric_card(answer, rubric, question_num, max_score) if use_card else None
+        source = None
+    if source:
+        pass
+    elif card and not z.validate_rubric_card(card, max_score):
         source = "评分卡"
     else:
         points, _src, _rules = z.resolve_rubric_points(rubric, answer, max_score)
@@ -119,7 +155,7 @@ def build_case(case_dir, base_config, use_card=True):
     guide = text_value(expected.get("guide"), "")
     prompt = z.gc.build_prompt(question_num, max_score, answer, card, half_point, question, guide)
     return {
-        "name": Path(case_dir).name,
+        "name": name,
         "dir": Path(case_dir),
         "image_path": image_path,
         "expected": expected,
@@ -197,6 +233,8 @@ def run_case(case, config, dry_run=False):
         return None
 
     image = Image.open(case["image_path"]).convert("RGB")
+    if case.get("trim"):
+        image = z.trim_bottom_taskbar(image)[0]
     grader = make_headless_grader(config)
     started = time.time()
     try:
@@ -335,18 +373,29 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="最多跑几个用例")
     parser.add_argument("--dry-run", action="store_true", help="只检查用例和评分卡，不调用模型")
     parser.add_argument("--no-card", action="store_true", help="不使用评分卡，直接按文本标准")
+    parser.add_argument("--archive", nargs="?", const="paper_archive", default=None,
+                        help="改跑原卷存档里老师看过分的卷子（默认 paper_archive）")
     args = parser.parse_args()
 
     base = Path(__file__).resolve().parent
     cases_dir = (base / args.cases).resolve() if not Path(args.cases).is_absolute() else Path(args.cases)
     config_path = (base / args.config).resolve() if not Path(args.config).is_absolute() else Path(args.config)
-    if not cases_dir.is_dir():
-        print("用例目录不存在：{}".format(cases_dir))
-        return 2
     if not config_path.is_file():
         print("配置文件不存在：{}".format(config_path))
         return 2
     config = read_json(config_path)
+    if args.archive:
+        adir = (base / args.archive).resolve() if not Path(args.archive).is_absolute() else Path(args.archive)
+        cases = archive_cases(adir, config, use_card=not args.no_card)
+        if args.limit:
+            cases = cases[:args.limit]
+        if not cases:
+            print("存档里没有老师看过分的卷子：{}".format(adir))
+            return 2
+        return run_all(cases, config, args, base)
+    if not cases_dir.is_dir():
+        print("用例目录不存在：{}".format(cases_dir))
+        return 2
 
     # 递归查找，老师改分自动存的用例在 eval_cases/corrections/ 下面
     case_dirs = sorted(p.parent for p in cases_dir.rglob("expected.json"))
@@ -364,7 +413,10 @@ def main():
             print("[跳过] {}：{}".format(case_dir.name, exc))
     if not cases:
         return 2
+    return run_all(cases, config, args, base)
 
+
+def run_all(cases, config, args, base):
     records = []
     for case in cases:
         record = run_case(case, config, dry_run=args.dry_run)
