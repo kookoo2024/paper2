@@ -20,90 +20,11 @@ import urllib.request
 import urllib.error
 import io
 
-HTTP_TIMEOUT = 120  # 兜底超时（秒）；批改调用会传更短的 15 秒目标
-GRADE_TIMEOUT = 15  # 单题批改硬上限：超过就中止，保证整体 <20 秒
+import grading_core as gc
 
-GRADING_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "transcription": {"type": "STRING"},
-        "symbol_map": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "student": {"type": "STRING"},
-                    "standard": {"type": "STRING"},
-                    "definition": {"type": "STRING"},
-                },
-                "required": ["student", "standard", "definition"],
-            },
-        },
-        "parts": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "part_id": {"type": "STRING"},
-                    "method_id": {"type": "STRING"},
-                    "part_type": {"type": "STRING", "enum": ["proof", "calculation"]},
-                    "complete_proof": {"type": "BOOLEAN"},
-                    "proof_evidence": {"type": "STRING"},
-                    "points": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "point_id": {"type": "STRING"},
-                                "full": {"type": "NUMBER"},
-                                "got": {"type": "NUMBER"},
-                                "evidence": {"type": "STRING"},
-                                "reason": {"type": "STRING"},
-                                "equivalent": {"type": "BOOLEAN"},
-                                "role": {"type": "STRING", "enum": ["process", "conclusion", "result"]},
-                                "checks": {
-                                    "type": "ARRAY",
-                                    "items": {
-                                        "type": "OBJECT",
-                                        "properties": {
-                                            "requirement": {"type": "STRING"},
-                                            "shown": {"type": "BOOLEAN"},
-                                            "evidence": {"type": "STRING"},
-                                            "equivalent": {"type": "BOOLEAN"},
-                                        },
-                                        "required": ["requirement", "shown", "evidence", "equivalent"],
-                                    },
-                                },
-                            },
-                            "required": ["point_id", "full", "got", "evidence", "reason"],
-                        },
-                    },
-                },
-                "required": ["part_id", "method_id", "points"],
-            },
-        },
-        "items": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "point": {"type": "STRING"},
-                    "full": {"type": "NUMBER"},
-                    "got": {"type": "NUMBER"},
-                    "evidence": {"type": "STRING"},
-                    "reason": {"type": "STRING"},
-                },
-                "required": ["point", "full", "got", "evidence", "reason"],
-            },
-        },
-        "score": {"type": "NUMBER"},
-        "confidence": {"type": "STRING"},
-        "unclear": {"type": "BOOLEAN"},
-        "alt_method": {"type": "BOOLEAN"},
-        "analysis": {"type": "STRING"},
-    },
-    "required": ["transcription", "score", "confidence", "unclear", "analysis"],
-}
+HTTP_TIMEOUT = 120  # 兜底超时（秒）；批改调用会传更短的 15 秒目标
+GRADE_TIMEOUT = 20  # 单题批改硬上限：超过就中止
+
 
 # 配置 Gemini API
 
@@ -237,7 +158,7 @@ class QuotaError(Exception):
     """API 额度/限流错误：外层会自动尝试本机 Magpie。"""
 
 # ================= 在线更新 =================
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.0"
 CARD_VERSION = 3
 UPDATE_REPO = "kookoo2024/paper2"   # 从这个 GitHub 仓库拉新版本
 UPDATE_BRANCH = "main"
@@ -1058,41 +979,6 @@ def resolve_rubric_points(rubric_text, standard_answer, max_score):
     return default_rubric(standard_answer, max_score), "auto", rules
 
 
-def extract_deduction_values(rules):
-    """提取评分标准里明确写出的扣分数额，只有这些部分分才允许保留。"""
-    import re
-    explicit = list((rules or {}).get("deduction_rules") or [])
-    if explicit:
-        return {round(float(r.get("amount", 0)), 2) for r in explicit}
-    text = "\n".join(
-        list((rules or {}).get("notes") or [])
-        + list((rules or {}).get("zero_rules") or [])
-        + [str((rules or {}).get("cap_text") or "")]
-    )
-    values = set()
-    for m in re.finditer(r"扣\s*([0-9]+(?:\.[0-9]+)?)\s*分", text):
-        values.add(round(float(m.group(1)), 2))
-    return values
-
-
-def deduction_allowed(item_index, deduction, rules):
-    """只有扣分条款明确属于该给分点时，才允许保留部分分。"""
-    explicit = (rules or {}).get("deduction_rules") if isinstance(rules, dict) else rules
-    if not explicit:
-        return False
-    if isinstance(explicit, (set, list, tuple)) and all(
-            not isinstance(x, dict) for x in explicit):
-        return round(float(deduction), 2) in {round(float(x), 2) for x in explicit}
-    for rule in explicit:
-        if not isinstance(rule, dict):
-            continue
-        if rule.get("point_index") != item_index:
-            continue
-        if abs(float(rule.get("amount", 0)) - float(deduction)) <= 0.01:
-            return True
-    return False
-
-
 def extract_equivalents(text):
     """从「（或 xxx、yyy）」里提取等价写法。"""
     import re
@@ -1163,79 +1049,6 @@ def format_score_levels(levels):
         for level in (levels or [])
         if isinstance(level, dict)
     ) or "无"
-
-
-def format_band_card_summary(card):
-    """返回“第1问（1/3/4）、第2问（…）”这样的分档摘要。"""
-    summaries = []
-    for part in (card or {}).get("parts") or []:
-        methods = part.get("methods") or [{}]
-        points = (methods[0] or {}).get("points") or [{}]
-        levels = (points[0] or {}).get("levels") or []
-        summaries.append(
-            f"第{part.get('id')}问（{format_score_levels(levels)}）")
-    return "、".join(summaries) or "无"
-
-
-def norm_alias_object(obj):
-    """统一“PD 的中点”“PD中点”“棱PD的中点”这类对象描述。"""
-    s = str(obj or "").upper().replace(" ", "").replace("　", "")
-    for word in ("的", "棱", "边", "线段", "直线"):
-        s = s.replace(word, "")
-    return s
-
-
-def extract_aliases(text):
-    """从“取PD中点H”“H为PD的中点”这类定义句提取学生自己的字母。"""
-    import re
-    s = str(text or "")
-    # 参考答案常用 \(PD\) 这类 LaTeX 定界符，先去壳再识别几何对象。
-    s = s.replace("\\(", "").replace("\\)", "").replace("$", "")
-    out = {}
-    patterns = (
-        # 取 PD 的中点 N / 取PD中点N / 作PD中点N
-        (r"(?:取|作|设|令|记)\s*([A-Z]{1,3})\s*的?\s*中点\s*(?:为|是|记作|记为)?\s*([A-Z])", 2, 1),
-        # 设/令/记 N 为 PD 的中点
-        (r"(?:设|令|记)\s*([A-Z])\s*(?:为|是)\s*(?:棱|边|线段|直线)?\s*([A-Z]{1,3})\s*的?\s*中点", 1, 2),
-        # N 为棱 PD 的中点 / N是PD中点
-        (r"([A-Z])\s*(?:为|是)\s*(?:棱|边|线段|直线)?\s*([A-Z]{1,3})\s*的?\s*中点", 1, 2),
-        # PD 的中点为 N
-        (r"([A-Z]{1,3})\s*的?\s*中点\s*(?:为|是|记作|记为)\s*([A-Z])", 2, 1),
-    )
-    for pattern, alias_group, obj_group in patterns:
-        for match in re.finditer(pattern, s):
-            alias = match.group(alias_group).upper()
-            obj = norm_alias_object(match.group(obj_group))
-            if not alias or not obj or alias == obj:
-                continue
-            out[alias] = f"{obj}中点"
-    return out
-
-
-def map_student_aliases(student_aliases, standard_aliases):
-    """把学生字母映射到标准字母；只按“同一个几何对象”绑定。"""
-    by_object = {}
-    for std, obj in (standard_aliases or {}).items():
-        by_object.setdefault(norm_alias_object(obj), std)
-    mapping = {}
-    for stu, obj in (student_aliases or {}).items():
-        std = by_object.get(norm_alias_object(obj))
-        if std and std != stu:
-            mapping[stu] = std
-    return mapping
-
-
-def apply_aliases(text, alias_map):
-    """按别名表替换学生字母。几何题的字母常相邻（MH、AH），不能按整词匹配。"""
-    import re
-    s = str(text or "")
-    for src in sorted((alias_map or {}), key=len, reverse=True):
-        dst = str(alias_map[src])
-        if not src or not dst:
-            continue
-        # 允许前面是另一个大写字母（MH→MN、AH→AN），但不碰英文单词内部。
-        s = re.sub(rf"(?<![a-z]){re.escape(src)}(?![a-z])", dst, s)
-    return s
 
 
 def _extract_part_headings(text, max_score):
@@ -1330,11 +1143,13 @@ def _groups_from_numbered_lines(text, points):
     lines = (text or "").splitlines()
     headers = []
     label_re = re.compile(
-        r"^\s*[（(]\s*([0-9]+|[ivxlcdmIVXLCDM]+)\s*[）)]")
+        r"^\s*(?:#+\s*)?(?:[（(]\s*([0-9]+|[ivxlcdmIVXLCDMⅠⅡⅢⅣⅤ]+)\s*[）)]"
+        r"|第\s*([0-9一二三四五]+)\s*[问小]|([ⅠⅡⅢⅣⅤ])\s*[.、．])")
     for index, line in enumerate(lines):
         match = label_re.match(line)
         if match:
-            headers.append((index, f"（{match.group(1)}）", match.group(1)))
+            label = next(g for g in match.groups() if g)
+            headers.append((index, f"（{label}）", label))
             continue
         # 第一行常见“18.【答案】（1）【证明】…”这种写法
         if index == 0:
@@ -1378,23 +1193,6 @@ def _deductions_for_point(index, rules):
         if isinstance(rule, dict) and rule.get("point_index") == index:
             out.append(float(rule.get("amount", 0) or 0))
     return out
-
-
-def _is_independent_point(point):
-    """老师显式标为共用或结果点的采分点。不要从题干文字猜。"""
-    return bool((point or {}).get("shared") or (point or {}).get("result_only"))
-
-
-def _result_role_allowed(point, method, raw_point, part_type=""):
-    """结果点可由老师显式标记，或由模型标为该解法最后一步；中间点不能冒充结果点。"""
-    if (point or {}).get("result_only"):
-        return True
-    if part_type != "calculation":
-        return False
-    if not raw_point or raw_point.get("role") != "result":
-        return False
-    points = (method or {}).get("points") or []
-    return bool(points and str(point.get("id")) == str(points[-1].get("id")))
 
 
 def _alternative_methods_from_notes(parts, *texts):
@@ -1527,124 +1325,6 @@ def card_flat_points(card):
     return out
 
 
-def card_part_summary(card):
-    card = upgrade_rubric_card(card)
-    return [(str(p.get("id")), str(p.get("title")), float(p.get("max_score", 0) or 0),
-             len(p.get("methods") or [])) for p in (card.get("parts") or [])]
-
-
-def missing_card_parts(result, card):
-    """模型返回的 parts 里缺少哪些小问。"""
-    expected = [str(p.get("id")) for p in (card or {}).get("parts") or []]
-    got = {str(p.get("part_id")) for p in (result or {}).get("parts") or []
-           if isinstance(p, dict)}
-    return [part_id for part_id in expected if part_id not in got]
-
-
-def merge_grading_results(first, second, card):
-    """合并两次返回：同一小问优先用第二次，缺的小问从第一次补。"""
-    first = first if isinstance(first, dict) else {}
-    second = second if isinstance(second, dict) else {}
-    by_id = {}
-    for source in (first, second):
-        for part in source.get("parts") or []:
-            if isinstance(part, dict) and str(part.get("part_id", "")).strip():
-                by_id[str(part.get("part_id")).strip()] = part
-    merged = dict(second)
-    merged["parts"] = [
-        by_id[str(part.get("id"))]
-        for part in (card or {}).get("parts") or []
-        if str(part.get("id")) in by_id
-    ]
-    first_text = str(first.get("transcription") or "")
-    second_text = str(second.get("transcription") or "")
-    merged["transcription"] = second_text if len(second_text) >= len(first_text) else first_text
-    symbols = []
-    for source in (first, second):
-        for symbol in source.get("symbol_map") or []:
-            if symbol not in symbols:
-                symbols.append(symbol)
-    merged["symbol_map"] = symbols
-    if not str(merged.get("analysis") or "").strip():
-        merged["analysis"] = str(first.get("analysis") or "")
-    return merged
-
-
-def _point_deductions(point, fallback=None):
-    values = []
-    for value in (point or {}).get("deductions") or []:
-        try:
-            values.append(round(float(value), 2))
-        except (TypeError, ValueError):
-            pass
-    if not values and fallback:
-        for value in fallback:
-            if isinstance(value, (int, float)):
-                values.append(round(float(value), 2))
-    return values
-
-
-def split_requirement_units(text):
-    """把一条采分点拆成给模型看的核对提示（程序不按条数机械卡人）。
-
-    只按评分标准里的通用逻辑连接词拆分，不依赖题号、字母或题型。
-    """
-    import re
-    source = str(text or "").strip()
-    if not source:
-        return []
-    chunks = re.split(
-        r"[；;]|→|->|\\therefore|∴|"
-        r"。\s*(?=(?:又|而|则|即|所以|因此|故|由|设|取|作|令|记))|"
-        r"，(?=(?:得|求出|解得|证出|推出|所以|进而|写出|得到|可得))",
-        source,
-    )
-    out = []
-    for chunk in chunks:
-        value = chunk.strip(" ，,。；;")
-        value = re.sub(
-            r"^(?:得|求出|解得|证出|推出|所以|进而|写出|得到|可得)\s*",
-            "", value,
-        ).strip()
-        if len(norm_math_text(value)) >= 3 and value not in out:
-            out.append(value)
-    return out or [source]
-
-
-def _point_checks(raw):
-    """读取模型返回的分项核对；旧响应没有 checks 时返回空列表。"""
-    checks = (raw or {}).get("checks")
-    if not isinstance(checks, list):
-        return []
-    out = []
-    for check in checks:
-        if not isinstance(check, dict):
-            continue
-        out.append({
-            "requirement": str(check.get("requirement") or "").strip(),
-            "shown": check.get("shown") is True,
-            "evidence": str(check.get("evidence") or "").strip(),
-            "equivalent": check.get("equivalent") is True,
-        })
-    return out
-
-
-def _v2_item(part, method, point, got, evidence, reason):
-    return {
-        "point": str(point.get("text", "") or point.get("goal", "")),
-        "full": float(point.get("full", 0) or 0),
-        "got": float(got),
-        "reason": str(reason or ""),
-        "evidence": str(evidence or ""),
-        "part_id": str(part.get("id", "")),
-        "part_title": str(part.get("title", "")),
-        "method_id": str(method.get("id", "")),
-        "method_name": str(method.get("name", "")),
-        "point_id": str(point.get("id", "")),
-        "role": str(point.get("role", "") or ""),
-    }
-
-
 def save_result_debug(result, card, score):
     """把最近一次原始判分写到 %TEMP%，方便复现“模型说满分、程序算0分”这类问题。"""
     try:
@@ -1671,7 +1351,11 @@ def build_rubric_card(answer_text, rubric_text, question_num, max_score):
     if not points:
         return None
 
-    groups = _groups_from_numbered_lines(answer_text, points)
+    # 先用给分点所在的文本切小问（手填给分点时就是给分点框），再试参考答案
+    first, second = ((rubric_text, answer_text) if source == "rubric"
+                     else (answer_text, rubric_text))
+    groups = (_groups_from_numbered_lines(first, points)
+              or _groups_from_numbered_lines(second, points))
     if not groups:
         part_specs = _extract_part_headings(answer_text, max_score)
         if not part_specs:
@@ -1757,7 +1441,7 @@ def build_rubric_card(answer_text, rubric_text, question_num, max_score):
         "cumulative_raw": list(rules.get("cumulative_raw") or []),
         "parts": parts,
         "points": card_points,
-        "aliases": extract_aliases(answer_text),
+        "aliases": {},
         "rules": list(rules.get("notes") or [])[:12],
         "score_cap": rules.get("score_cap"),
         "cap_text": rules.get("cap_text", ""),
@@ -1865,242 +1549,6 @@ def rules_from_card(card):
     }
 
 
-def build_grading_prompt_v2(question_num, max_score, standard_answer, rubric_text,
-                            half_point, card):
-    """v2 提示词：按小问列多套解法，模型选一套并逐点找证据。"""
-    lines = []
-    for part in card.get("parts") or []:
-        lines.append(f"【第{part.get('id')}小问】{part.get('title')}  "
-                     f"满分{fmt_score(part.get('max_score', 0))}分")
-        for method in part.get("methods") or []:
-            method_total = sum(float(p.get("full", 0) or 0)
-                               for p in (method.get("points") or []))
-            lines.append(f"  解法 {method.get('id')}「{method.get('name')}」"
-                         f"合计{fmt_score(method_total)}分")
-            if method.get("notes"):
-                lines.append(f"    说明：{method['notes']}")
-            for point in method.get("points") or []:
-                if point.get("result_only"):
-                    shared_tag = "【结果】"
-                elif point.get("shared"):
-                    shared_tag = "【共用】"
-                else:
-                    shared_tag = ""
-                line = (f"    {shared_tag}{point.get('id')}（{fmt_score(point.get('full', 0))}分）："
-                        f"{point.get('text', '')}")
-                if point.get("band"):
-                    levels = point.get("levels") or []
-                    allowed = format_score_levels(levels)
-                    line += f"；只允许 0 或 {allowed} 分，不得自行拆成其他分"
-                    lines.append(line)
-                    for index, level in enumerate(levels, 1):
-                        prefix = ("达到本档还须在完成前面各档的基础上做到"
-                                  if index > 1 else "本档要求")
-                        lines.append(
-                            f"      {fmt_score(level.get('score', 0))}分档："
-                            f"{prefix}：{level.get('text', '')}")
-                    if point.get("deductions"):
-                        lines.append(
-                            "      明确扣分："
-                            + "、".join(f"扣{fmt_score(x)}分"
-                                        for x in point["deductions"]))
-                    continue
-                equivalents = [str(x).strip() for x in (point.get("equivalents") or [])
-                               if str(x).strip()]
-                if equivalents:
-                    line += "；等价写法：" + "、".join(equivalents)
-                if point.get("notes"):
-                    line += "；" + str(point["notes"])
-                lines.append(line)
-    card_text = "\n".join(lines)
-    answer_note = ""
-    if card.get("source") == "answer":
-        answer_note = ("\n（注意：上面『参考答案』里若带有分值，可能是累计分或原卷标注，"
-                       "一律不作为计分依据；只按下面『评分卡』的分值判。）")
-    return f"""你是高中数学阅卷老师。图片是学生第{question_num}题的作答，满分{fmt_score(max_score)}分。
-
-参考答案：
-{standard_answer}{answer_note}
-
-评分卡（唯一评分依据；每个小问只能选一套解法，不得跨解法凑分）：
-{card_text}
-
-判分要求（严格执行，不得放宽）：
-前置原则：证明题先看逻辑链条是否完整，不要因为没用标准辅助线/标准方法就判低；计算题先看最终结果是否正确，结果对的结果点必须给分。两种判断都只能依据学生原文，不能替学生补步骤。
-0. 先把图片里学生的关键步骤和结论完整转写（数学式用普通写法或 LaTeX，看不清写【看不清】），放在 transcription，控制在 600 字以内；后续判分只能依据这份转写，不许凭印象补。尤其不要漏掉每一问的最后结论、负号、两个解和最终数值。
-1. 每个小问先判断学生用的是哪一套解法，method_id 只能填该小问下面列出的解法编号；选了哪套就只按那套的采分点判，不能把两套解法的分拼在一起。若学生用了未列出的方法，method_id 填 "uncovered"，不要硬套某一套。
-1b. 每个 part 填 part_type："proof" 表示证明题，"calculation" 表示计算/求值题。每个 point 填 role："process"（中间过程）、"conclusion"（几何/逻辑结论）或 "result"（最终数值/结果）。角色由你按数学内容判断，不要按题号或字母猜。
-1b2. role="result" 只能用于 calculation 小问的最后一个结果点，或评分卡明确标了【结果】的点；中间步骤、证明题的步骤都不能标 result。
-1c. 评分卡里写“整问按原标准分档”的小问只有一个评分单元，不再逐句拆分小点，也不需要输出 checks。先整体看学生数学上完成到原标准的哪一档，不要因为没照抄标准步骤、辅助线、字母或写法就判低。
-2. 分档描述是判断数学完成度的依据，不是要求学生逐字出现的“关键词清单”。学生用另一种正确方法，只要该档要求的数学结论、证明链条或计算结果实际上已经完成，就应当给该档；只有该档确有内容缺失、跳步、错误或尚未完成时，才落到前面已经完整达到的最高档。严禁按“像不像标准答案”酌情给分，也不要自行创造评分卡之外的分数。
-3. 每个分档点的 full 就是该小问满分；got 只能填 0、该点列出的某个档位分，或标准明确写明的“满分−扣分数”。不得自行给 1.5、3.5 等卡外分数。若学生只完成某档的一部分，只能取前面已经完整达到的最高档；一档都没完整达到就是 0 分。
-4. 学生用不同字母表示同一个几何对象时，先建立别名，再判分。例如“取 PD 的中点 H”表示 H 就是标准解法里的 N，后面 MH∥CD 等价于 MN∥CD。别名必须有学生原文里的定义句，不能猜；没有定义句的字母不要自行绑定。
-4b. 学生写“∥=”“平行且等于”“平行且相等”时，表示同时平行且相等；不要只按平行处理。像“MH∥=½CD∥=AB”已经推出 MH∥AB 且 MH=AB，平行四边形条件完整，不要因为没单独再写“AB=MN”而扣分。
-5. 如果学生的方法不在任何一套解法里，method_id 填 "uncovered"。仍然按分档内容整体判断数学上是否达到各档；标了【共用】或【结果】的点照常判断。给分时把该 point 的 "equivalent" 填 true，表示学生用等价方法完成。不要把“方法不同”本身当成扣分理由，也不要因为没出现标准辅助线或字母就压档。
-5b. 计算题若原标准的某一档明确只要求最终结论/数值，看到正确结果即可给到该档；若该档还要求推导、方程或过程，则不能只凭最终结果跳到该档。正确结果不能被漏掉，也不能用它倒推学生没写出的更高档过程。
-5c. 证明小问如果学生用了任何方法（包括未列出的方法），但证明过程完整、逻辑正确，并且明确写出了该结论所需的条件，则按该小问所有采分点满分处理。此时填 "part_type":"proof" 和 "complete_proof":true，并在 "proof_evidence" 中引用覆盖证明链条的原文；points 可以按标准点返回，也可以留空，程序会按该小问满分。证明不完整、跳步或只写结论的，complete_proof 填 false，不能虚报。
-6. 每个得到分的分档点都要填 evidence：从 transcription 里摘录最能证明“为什么达到这一档”的连续学生原文，可包含多个式子，控制在 100 字以内。got 为 0 时 evidence 可以留空。got 大于 0 却没有 evidence，或 evidence 在 transcription 里找不到，程序会改判 0 分。不要再输出 checks。
-7. 每个小问的得分不能超过该小问满分；score 必须等于各小问得分之和，绝不能超过 {fmt_score(max_score)} 分。
-8. 拿不准是否完成该点时按未完成处理（记 0 分）；但已经明确写出的正确结论不能被否定。同一处错误只扣一次。
-9. 不要输出“小计”“合计”这类汇总行；points 只列该小问评分卡里的那一个分档点，point_id 必须使用卡里的编号。method_id=uncovered 时，请在得分的 point 里填 "equivalent":true；没有填或填 false 的程序按 0 分处理。
-
-证据要求（硬性）：
-- got 大于 0 的每个点都必须有 evidence，而且 evidence 必须能在 transcription 里找到。
-- evidence 要能说明该档位所需的数学完成度，不能只写“会做”“正确”等空话；但也不要要求逐字包含分档描述。
-- reason 写清这一分给在哪一步、为什么，不超过 16 字。
-
-等价判定（双向严格，必须照做）：
-- 等价指学生写出的内容与给分点要求的是同一个数学对象或同一个结论，能通过移项、恒等变形、代入、参数化互相得到。例如：15x−8y−55=0 与 8y=15x−55、y=(15/8)x−55/8 等价；法向量 (2,-2,4) 与 (1,-1,2) 等价；换原点后坐标不同但二面角余弦相同，等价。
-- 等价写法必须按该给分点给满分，不得因形式不同、步骤顺序不同、字母符号不同而扣分或记 0 分。
-- 以下一律不算等价、记 0 分：只写了相关公式或概念但没写出该点结果；只写“由…可得”后面没有结果；结果数值、符号或范围错误；推导与结论无关。
-
-直接输出 JSON，不要任何别的文字。transcription 和 evidence 都写成一行，不要换行，不要出现英文双引号（需要引用时用「」），否则 JSON 会解析失败：
-{{"transcription":"学生答卷原文（逐行）","symbol_map":[{{"student":"H","standard":"N","definition":"取PD中点H"}}],"parts":[{{"part_id":"1","method_id":"1-A","part_type":"proof","complete_proof":false,"proof_evidence":"","points":[{{"point_id":"1-A-1","full":4,"got":3,"evidence":"学生原文摘录","reason":"达到3分档","equivalent":false}}]}}],"score":总分,"confidence":"高/中/低","unclear":false,"analysis":"一句话评语"}}"""
-
-
-def build_grading_prompt(question_num, max_score, standard_answer, rubric_text, half_point, card=None):
-    """批改提示词：一次请求，看图直接判分。严格按给定给分点，不自行加码。"""
-    card_ok = card and not validate_rubric_card(card, max_score)
-    if card_ok:
-        card = upgrade_rubric_card(card, max_score)
-        if card.get("parts"):
-            return build_grading_prompt_v2(
-                question_num, max_score, standard_answer, rubric_text, half_point, card)
-        scored = [(p["text"], float(p["full"])) for p in card["points"]]
-        source, rules = "card", rules_from_card(card)
-    else:
-        scored, source, rules = resolve_rubric_points(rubric_text, standard_answer, max_score)
-    if scored:
-        if card_ok:
-            lines = []
-            for i, p in enumerate(card["points"], 1):
-                line = f"{i}. {p['text']}（{fmt_score(p['full'])}分）"
-                eq = [e for e in (p.get("equivalents") or []) if e]
-                if eq:
-                    line += "；等价写法：" + "、".join(eq)
-                if p.get("notes"):
-                    line += "；" + str(p["notes"])
-                lines.append(line)
-            rows = "\n".join(lines)
-        else:
-            rows = "\n".join(f"{i+1}. {p}（{fmt_score(v)}分）" for i, (p, v) in enumerate(scored))
-        origin = {"rubric": "", "answer": "（取自参考答案中的评分标准）",
-                  "card": "（评分卡，已确认）"}.get(source, "")
-        rubric_part = f"给分点{origin}（唯一评分依据，不增不减、不改分值）：\n{rows}"
-        if rules["cumulative"]:
-            raw = "、".join(str(fmt_score(v)) for v in rules["cumulative_raw"])
-            rubric_part += (f"\n（原标准写作累计分 {raw}，已换算为每步增量；"
-                            f"full 一律填增量分，不得填累计分）")
-        import re as _re
-        rule_lines = [n for n in rules.get("notes", [])
-                      if len(n) <= 120 and
-                      _re.search(r"(扣|零分|不得|最多|至少|必须|同时|分别|关键|采分点|注意|若|如果)", n)]
-        if rule_lines:
-            rubric_part += "\n评分说明（与给分点同等约束）：\n" + "\n".join(
-                f"- {n.lstrip('-*•· ')}" for n in rule_lines[:10])
-    else:
-        rubric_part = ("给分点：未提供。按参考答案的解题步骤逐条给分：每条分值按参考答案标注的步骤分，"
-                       "没标注的按步骤在满分内拆分；只给完成了该步骤的分数，不得给步骤之外的分数。")
-    answer_note = ""
-    if source == "answer":
-        answer_note = ("\n（注意：上面『参考答案』里若带有分值，可能是累计分或原卷标注，"
-                       "一律不作为计分依据；只按下面『给分点』的分值判。）")
-    return f"""你是高中数学阅卷老师。图片是学生第{question_num}题的作答，满分{fmt_score(max_score)}分。
-
-参考答案：
-{standard_answer}{answer_note}
-
-{rubric_part}
-
-判分要求（严格执行，不得放宽）：
-0. 先把图片里学生的关键步骤和结论完整转写（数学式用普通写法或 LaTeX，看不清写【看不清】），放在 transcription，控制在 600 字以内；后续判分只能依据这份转写，不许凭印象补。尤其不要漏掉每一问的最后结论、负号、两个解和最终数值。
-1. 只按图片里看得到的内容判，不替学生补步骤；字迹看不清影响判分时 unclear 填 true。
-2. 逐条对照给分点：学生答案里必须明确写出该点要求的公式、方程或结论（或数学上等价的正确表达），才给该点满分；没看到该得分点、也没有等价表达，或只写相关思路、跳步、该点结论写错的，该点一律记 0 分。严禁酌情给分，不给“思路分”“步骤分”“同情分”，不凑分。
-2b. 每个给分点的 got 只能是 0、full，或评分标准明确写明的 full−N；标准没有写明扣分数额的，一律只能是 0 分或满分，不许自行估扣、不许按比例给分，也不许因为“写了一半”给一半。
-2c. 给分点里的“且”“同时”“分别”“必须交代”“并且”都是并列必要条件，缺一项该点就是 0 分；写“或”的地方任一形式成立即可。
-2d. 同一个给分点里用顿号列出的多个结果，也属于该点的全部要求。evidence 必须覆盖这些要求；覆盖了就必须填 full，不能因为学生写得简略、没有重复展开或步骤顺序不同而给部分分。只有 2b 明确允许的扣分才能低于 full。
-2e. 计算题的最后结果点独立核对：只要最终结果/数值正确，即使中间步骤没写、写得简略或方法不同，也给该结果点的满分；不能因为前面步骤没写而把结果点判 0。其他过程点仍必须看到对应过程或等价过程。
-3. 不得新增、拆分、合并给分点，不得改动每条给分点的分值，也不得在给分点之外额外给分。
-4. 学生用等价解法（如用极点极线直接写切点弦方程），只要确实完成了该给分点要求，按该点给分，alt_method 填 true；等价解法不是加分理由，也不改变分值。
-4b. 证明题如果学生用未列出的方法，但证明完整、逻辑正确并写出了结论所需条件，按该小问满分处理，items 中每个点填 full；如果证明不完整、跳步或只写结论，只按实际完成点给分，不能按满分。
-5. 前一步算错导致后面数值错、但后面步骤本身写对，按该给分点给分；除 2e 明确规定的最终结果点外，只有结果没有过程的过程点记 0 分。
-6. 不因书写潦草（能看清的）或格式扣分。
-7. items 只列上面的给分点，顺序和分值保持原样，禁止输出“第(1)问合计”“小计”“总分”这类汇总行。
-8. full 必须是「这一步新增的分值」，不是累计到这一步的总分；所有 full 相加必须正好等于 {fmt_score(max_score)} 分；score 必须等于 items 中 got 之和，绝不能超过满分。got 不是 0/full 时，必须在 reason 里说明评分标准哪一条明确允许这个扣分；否则程序会改判 0。
-9. 拿不准是否完成该点时按未完成处理（记 0 分）；但已经明确写出的正确结论不能被否定。同一处错误只扣一次。
-
-证据要求（硬性）：
-- 每个给分点都要填 evidence：从 transcription 里摘录支持该点得分的那一小段学生原文（一两个式子即可，不超过 40 字）。got 为 0 时 evidence 留空字符串。
-- got 大于 0 却没有 evidence，程序会直接把该点改判 0 分；所以没看到、只是觉得“应该会”的，一律不要给分。
-- reason 写清这一分给在哪一步、为什么，不超过 12 字。
-
-等价判定（双向严格，必须照做）：
-- 等价指学生写出的内容与给分点要求的是同一个数学对象或同一个结论，能通过移项、恒等变形、代入、参数化互相得到。例如：15x−8y−55=0 与 8y=15x−55、y=(15/8)x−55/8 等价；(x−3/2)²+(y+3)²=17/4 与 x²+y²−3x+6y+7=0 等价；用极点极线直接写切点弦，与四点共圆、两圆相减得到同一条直线等价；向量法、坐标法、几何法得到同一结论等价。
-- 等价写法必须按该给分点给满分，不得因形式不同、步骤顺序不同、字母符号不同而扣分或记 0 分。
-- 以下一律不算等价、记 0 分：只写了相关公式或概念但没写出该点结果；只写“由…可得”后面没有结果；结果数值、符号或范围错误；推导与结论无关。
-- 判定方法：先在学生答卷里找到该点要求的最终结果（公式/方程/数值/结论），再判断是否等价；找不到就记 0 分，不要用“他应该会”“思路对”来补。
-
-直接输出 JSON，不要任何别的文字。transcription 和 evidence 都写成一行，不要换行，不要出现英文双引号（需要引用时用「」），否则 JSON 会解析失败：
-{{"transcription":"学生答卷原文（逐行）","items":[{{"point":"给分点","full":分值,"got":得分,"evidence":"学生原文摘录","reason":"理由"}}],"score":总分,"confidence":"高/中/低","unclear":false,"alt_method":false,"analysis":"一句话评语"}}"""
-
-
-def norm_math_text(s):
-    """归一化数学文本：去空白/标点/LaTeX 符号差异，便于比对依据。"""
-    import re
-    s = str(s or "")
-    s = s.replace("$", "")
-    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
-    s = s.replace("∥", "//").replace("／", "/").replace("∕", "/")
-    commands = {
-        "parallel": "//", "perp": "⊥", "angle": "∠", "triangle": "△",
-        "because": "∵", "therefore": "∴", "cdot": "*", "times": "*", "div": "÷",
-        "pm": "±", "mp": "∓", "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥",
-        "neq": "≠", "ne": "≠", "approx": "≈", "equiv": "≡",
-        "Rightarrow": "⇒", "Leftrightarrow": "⇔", "rightarrow": "→", "to": "→",
-        "in": "∈", "notin": "∉", "subseteq": "⊆", "subset": "⊂",
-        "cup": "∪", "cap": "∩",
-        "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
-        "theta": "θ", "lambda": "λ", "mu": "μ", "pi": "π",
-        "rho": "ρ", "sigma": "σ", "phi": "φ", "omega": "ω",
-        "Delta": "Δ", "Sigma": "Σ", "Omega": "Ω",
-    }
-    for name in sorted(commands, key=len, reverse=True):
-        s = re.sub(r"\\" + re.escape(name) + r"(?![A-Za-z])", commands[name], s)
-    s = re.sub(r"\\(?:left|right|big|Big|bigg|Bigg)\b", "", s)
-    s = re.sub(r"\\[,;:!]", "", s)
-    for _ in range(3):
-        s = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", s)
-        s = re.sub(r"\\sqrt\s*\{([^{}]*)\}", r"√(\1)", s)
-        s = re.sub(r"\\sqrt\s*([0-9A-Za-z])", r"√\1", s)
-        s = re.sub(r"\\(?:mathrm|mathbf|mathit|text|operatorname)\s*\{([^{}]*)\}", r"\1", s)
-        s = re.sub(r"\\(?:vec|overrightarrow|overline|underline)\s*\{([^{}]*)\}", r"\1", s)
-    s = s.replace("\\", "")
-    s = s.replace("平行", "//").replace("垂直", "⊥").replace("三角形", "△")
-    s = s.replace("因为", "∵").replace("所以", "∴").replace("根号", "√")
-    s = re.sub(r"[\s，,。；;：:、（）()\[\]{}【】“”\"'']", "", s)
-    return s.lower()
-
-
-def evidence_supported(evidence, transcription):
-    """依据是否真能在答卷原文里找到（容忍 OCR 小差异）。"""
-    ev = norm_math_text(evidence)
-    tr = norm_math_text(transcription)
-    if len(ev) < 3 or not tr:
-        return True
-    if ev in tr:
-        return True
-    import difflib
-    m = difflib.SequenceMatcher(None, ev, tr).find_longest_match(0, len(ev), 0, len(tr))
-    if len(ev) <= 12:
-        return m.size / len(ev) >= 0.95
-    if m.size / len(ev) >= 0.7:
-        return True
-    from collections import Counter
-    ce, ct = Counter(ev), Counter(tr)
-    hit = sum(min(v, ct[k]) for k, v in ce.items())
-    return hit / len(ev) >= 0.85
-
-
 def repair_json_latex(text):
     """把 JSON 字符串里未转义的 LaTeX 命令补成双反斜杠。"""
     import re
@@ -2180,573 +1628,6 @@ def iter_balanced_json_objects(text):
                 start = None
 
 
-def _goal_text(text):
-    """把评分点/证据整理成便于检查关键步骤的普通数学文本。"""
-    import re
-    s = str(text or "")
-    s = s.replace("\\not\\subset", "⊄").replace("\\not\\in", "∉")
-    replacements = (
-        ("\\perp", "⊥"), ("\\parallel", "∥"), ("\\subset", "⊂"),
-        ("\\cos", "cos"), ("\\sqrt", "√"), ("\\overrightarrow", ""),
-        ("\\vec", ""), ("\\because", "∵"), ("\\therefore", "∴"),
-        ("垂直于", "⊥"), ("平行于", "∥"),
-    )
-    for old, new in replacements:
-        s = s.replace(old, new)
-    s = s.replace("\\(", "").replace("\\)", "").replace("$", "")
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
-
-def _point_goal_covered(text, evidence, alias_map):
-    """用通用“关键步骤”检查证据，避免把正确的计算结果误判成 0。
-
-    只拦明显的结果倒灌，例如只写 λ 的值、没有写距离公式；
-    不要求模型把每一个推导小句都拆成独立 check。
-    """
-    import re
-    t = _goal_text(apply_aliases(text, alias_map))
-    e = _goal_text(apply_aliases(evidence, alias_map))
-    if not e:
-        return False
-
-    # “BM 不在平面内 + AN 在平面内”这类必须同时交代的条件。
-    if "⊄" in t and "⊂" in t:
-        left = re.findall(r"([A-Z]{1,4})\s*[，,]?\s*⊄", t)
-        right = re.findall(r"([A-Z]{1,4})\s*[，,]?\s*⊂", t)
-        if left and right:
-            if not all(label in e for label in left + right):
-                return False
-
-    # 证明“取 PD 的中点 N”这类构造，证据里必须出现该对象和中点。
-    construct = re.match(
-        r"^\s*(?:取|作|设|令|记)\s*([A-Z]{1,4})\s*的?\s*中点", t)
-    if construct:
-        obj = construct.group(1)
-        if "中点" not in e or obj not in e:
-            return False
-
-    if "平行四边形" in t:
-        if not any(word in e for word in (
-                "平行四边形", "矩形", "平行且相等", "∥=")):
-            return False
-
-    if "⊥平面" in t or "⊥ 平面" in t:
-        if "⊥" not in e or not any(word in e for word in ("平面", "底面")):
-            return False
-
-    if "法向量" in t and "cos" not in t.lower() and "距离" not in t:
-        if not re.search(r"\([^()]*,[^()]*,[^()]*\)", e):
-            return False
-
-    if "cos" in t.lower():
-        if "cos" not in e.lower():
-            return False
-
-    if "坐标" in t:
-        if len(re.findall(r"\([^()]*,[^()]*,[^()]*\)", e)) < 3:
-            return False
-
-    if "距离" in t or "公式" in t:
-        if not any(mark in e for mark in ("距离", "公式", "√", "|")):
-            return False
-
-    if "BQ" in t and "BQ" not in e:
-        return False
-
-    return True
-
-
-def _score_point_v2(point, raw, transcription, alias_map, normalized_transcription,
-                    allowed_deductions=None, allow_result_role=True):
-    """按一个采分点判分，返回 (got, evidence, reason, program_note)。"""
-    try:
-        full = float(point.get("full", 0) or 0)
-    except (TypeError, ValueError):
-        full = 0.0
-    got = 0.0
-    evidence = ""
-    reason = "未返回该得分点"
-    note = ""
-    if not raw:
-        return got, evidence, reason, note
-    try:
-        got = float(raw.get("got", 0) or 0)
-    except (TypeError, ValueError):
-        got = 0.0
-    got = max(0.0, min(got, full))
-    evidence = str(raw.get("evidence", "") or "").strip()
-    reason = str(raw.get("reason", "") or "")
-    role = str(raw.get("role", "") or "").strip().lower()
-    if not role:
-        role = "result" if point.get("result_only") else "process"
-    if role == "result" and not allow_result_role:
-        role = "process"
-
-    # 模型偶尔把 2 分点也按“1 分制”返回：它自己的 full=1、got=1，
-    # 说明它判的是“这一点完整”，应换算成卡里的满分；若理由里有
-    # 未/缺/错/少/仅/漏等否定词，则不换算，避免把半对判成满分。
-    model_full = raw.get("full")
-    try:
-        model_full = float(model_full) if model_full is not None else None
-    except (TypeError, ValueError):
-        model_full = None
-    if model_full is not None and model_full > 0 \
-            and abs(model_full - full) > 0.01 \
-            and abs(got - model_full) <= 0.01:
-        negative_words = ("未", "缺", "错", "少", "仅", "只", "漏",
-                          "不完整", "不成立", "不对")
-        if not any(word in reason for word in negative_words):
-            got = full
-            note = (f"{point.get('id')}按模型自己的满分判为完整，"
-                    f"已换算为卡里的 {fmt_score(full)} 分")
-
-    band_levels = []
-    for level in point.get("levels") or []:
-        try:
-            band_levels.append(round(float(level.get("score", 0) or 0), 2))
-        except (TypeError, ValueError, AttributeError):
-            continue
-    is_band = bool(point.get("band") or band_levels)
-
-    if is_band:
-        # 整问分档：只接受原标准列出的档位，或明确写出的“满分−扣分”。
-        allowed_scores = set(band_levels)
-        for deduction in _point_deductions(point, allowed_deductions):
-            allowed_scores.add(round(max(0.0, full - float(deduction)), 2))
-        if got > 0 and not any(abs(got - value) <= 0.01
-                               for value in allowed_scores):
-            got = 0.0
-            note = f"{point.get('id')}给了原标准未列出的档位分，已按 0 分"
-    else:
-        checks = _point_checks(raw)
-        shown_evidence = []
-        invalid_check = ""
-        for check in checks:
-            if not check["shown"]:
-                continue
-            check_evidence = check["evidence"]
-            if not check_evidence or not evidence_supported(
-                    apply_aliases(check_evidence, alias_map),
-                    normalized_transcription):
-                invalid_check = check["requirement"] or "未命名核对项"
-                break
-            if check_evidence not in shown_evidence:
-                shown_evidence.append(check_evidence)
-        if shown_evidence:
-            evidence = "；".join(shown_evidence) if not evidence else evidence
-        if invalid_check and got > 0:
-            got = 0.0
-            note = f"{point.get('id')}的核对项「{invalid_check}」没有对应原文，已按 0 分"
-
-        # 旧式逐点卡仍防“结果倒灌过程”；整问分档由档位整体判断。
-        if got >= full - 1e-6 and role != "result":
-            if not _point_goal_covered(point.get("text", ""), evidence, alias_map):
-                got = 0.0
-                note = (f"{point.get('id')}只写了结果，"
-                        f"没有覆盖该点要求的关键步骤，已按 0 分")
-
-        if 0 < got < full - 1e-6:
-            deduction = round(full - got, 2)
-            if deduction not in _point_deductions(point, allowed_deductions):
-                got = 0.0
-                note = f"{point.get('id')}给了标准未写明的部分分，已按 0 分"
-    if got > 0:
-        if not transcription.strip() or not evidence:
-            got = 0.0
-            note = f"{point.get('id')}没有引用学生原文，已按 0 分"
-        elif not evidence_supported(
-                apply_aliases(evidence, alias_map), normalized_transcription):
-            got = 0.0
-            note = f"{point.get('id')}的依据在答卷原文中找不到，已按 0 分"
-    return got, evidence, reason, note
-
-
-def settle_score_v2(result, card, max_score, half_point=False, score_cap=None,
-                    allowed_deductions=None):
-    """按 v2 评分卡逐小问、逐解法、逐点合成分数。"""
-    import math
-    reasons = []
-    items = []
-    parts = (card or {}).get("parts") or []
-    transcription = str(result.get("transcription", "") or "")
-    standard_aliases = dict((card or {}).get("aliases") or {})
-    student_aliases = extract_aliases(transcription)
-
-    # 模型给的别名只有在转写里找得到定义句时才采信。
-    for symbol in result.get("symbol_map") or []:
-        if not isinstance(symbol, dict):
-            continue
-        student = str(symbol.get("student") or "").strip().upper()
-        standard = str(symbol.get("standard") or "").strip().upper()
-        definition = str(symbol.get("definition") or "").strip()
-        if not student or not standard or student in student_aliases:
-            continue
-        if definition and evidence_supported(definition, transcription):
-            obj = standard_aliases.get(standard)
-            if obj:
-                student_aliases[student] = obj
-
-    alias_map = map_student_aliases(student_aliases, standard_aliases)
-    normalized_transcription = apply_aliases(transcription, alias_map)
-    if alias_map:
-        reasons.append("已识别学生字母别名：" + "、".join(
-            f"{k}→{v}" for k, v in sorted(alias_map.items())))
-
-    model_parts = {}
-    for model_part in result.get("parts") or []:
-        if isinstance(model_part, dict):
-            model_parts[str(model_part.get("part_id", "")).strip()] = model_part
-
-    total = 0.0
-    uncovered = False
-    for part in parts:
-        part_id = str(part.get("id", "")).strip()
-        try:
-            part_max = float(part.get("max_score", 0) or 0)
-        except (TypeError, ValueError):
-            part_max = 0.0
-        methods = {str(m.get("id", "")).strip(): m
-                   for m in (part.get("methods") or [])}
-        model_part = model_parts.get(part_id)
-        if not model_part:
-            reasons.append(f"第{part_id}小问没有返回判分结果，已按 0 分")
-            for method in part.get("methods") or []:
-                for point in method.get("points") or []:
-                    items.append(_v2_item(part, method, point, 0.0, "", "未返回该小问"))
-            continue
-
-        proof_evidence = str(model_part.get("proof_evidence") or "").strip()
-        part_type = str(model_part.get("part_type") or part.get("type") or "").strip()
-        if (model_part.get("complete_proof") is True
-                and part_type == "proof"
-                and proof_evidence
-                and evidence_supported(
-                    apply_aliases(proof_evidence, alias_map),
-                    normalized_transcription)):
-            default_method = (part.get("methods") or [None])[0]
-            default_points = (default_method or {}).get("points") or []
-            part_total = 0.0
-            for point in default_points:
-                got = float(point.get("full", 0) or 0)
-                part_total += got
-                items.append(_v2_item(
-                    part, default_method or {"id": "uncovered"},
-                    point, got, proof_evidence, "完整等价证明"))
-            part_total = min(part_total, part_max)
-            total += part_total
-            reasons.append(
-                f"第{part_id}小问为完整正确证明，已按本小问"
-                f" {fmt_score(part_total)} 分计")
-            continue
-
-        method_id = str(model_part.get("method_id", "")).strip()
-        if method_id != "uncovered" and method_id not in methods:
-            if len(methods) == 1 and not method_id:
-                method_id = next(iter(methods))
-            else:
-                method_id = "uncovered"
-        if method_id == "uncovered":
-            uncovered = True
-            # 未覆盖解法时，展示默认解法的点，再补上其他解法里
-            # 标为共用/结果的点；不能把所有解法的点重复列一遍。
-            unique_points = []
-            seen_points = set()
-            for method_index, method in enumerate(part.get("methods") or []):
-                for point in method.get("points") or []:
-                    point_id = str(point.get("id", "")).strip()
-                    if point_id and point_id not in seen_points \
-                            and (method_index == 0 or _is_independent_point(point)):
-                        unique_points.append((method, point))
-                        seen_points.add(point_id)
-            model_points = {}
-            for raw_point in model_part.get("points") or []:
-                if isinstance(raw_point, dict):
-                    model_points[str(raw_point.get("point_id", "")).strip()] = raw_point
-            part_total = 0.0
-            for method, point in unique_points:
-                point_id = str(point.get("id", "")).strip()
-                raw_point = model_points.get(point_id)
-                # 共用点和结果点天然独立于具体解法；其他点必须由
-                # 模型明确标出“等价方法”，再由程序做原文证据校验。
-                allowed = _is_independent_point(point) or bool(
-                    raw_point and (raw_point.get("equivalent") is True
-                                    or _result_role_allowed(
-                                        point, method, raw_point, part_type)))
-                if not allowed:
-                    items.append(_v2_item(part, method, point, 0.0, "", "未覆盖解法"))
-                    continue
-                got, evidence, reason, note = _score_point_v2(
-                    point, raw_point, transcription, alias_map,
-                    normalized_transcription, allowed_deductions,
-                    allow_result_role=_result_role_allowed(
-                        point, method, raw_point, part_type))
-                if note:
-                    reasons.append(note)
-                part_total += got
-                items.append(_v2_item(part, method, point, got, evidence, reason))
-            if part_total > 0:
-                reasons.append(f"第{part_id}小问用了未覆盖解法，"
-                               f"按共用/结果/等价采分点计 {fmt_score(part_total)} 分")
-            elif any(_is_independent_point(point) for _, point in unique_points):
-                reasons.append(f"第{part_id}小问用了未覆盖解法，"
-                               f"共用/结果采分点未完成，已按 0 分")
-            else:
-                reasons.append(f"第{part_id}小问：学生解法未覆盖评分卡中的任何一套，已按 0 分")
-            total += part_total
-            continue
-
-        method = methods[method_id]
-        point_map = {str(p.get("id", "")).strip(): p
-                     for p in (method.get("points") or [])}
-        model_points = {}
-        for raw_point in model_part.get("points") or []:
-            if isinstance(raw_point, dict):
-                model_points[str(raw_point.get("point_id", "")).strip()] = raw_point
-        if not model_points and isinstance(model_part.get("points"), list) \
-                and len(model_part["points"]) == len(point_map):
-            model_points = {key: value for key, value in zip(point_map, model_part["points"])
-                            if isinstance(value, dict)}
-
-        part_total = 0.0
-        for point_id, point in point_map.items():
-            got, evidence, reason, note = _score_point_v2(
-                point, model_points.get(point_id), transcription, alias_map,
-                normalized_transcription, allowed_deductions,
-                allow_result_role=_result_role_allowed(
-                    point, method, model_points.get(point_id), part_type))
-            if note:
-                reasons.append(note)
-            part_total += got
-            items.append(_v2_item(part, method, point, got, evidence, reason))
-
-        if part_total > part_max + 0.01:
-            reasons.append(f"第{part_id}小问逐点合计 {fmt_score(part_total)} 分，"
-                           f"超过小问满分，已封顶")
-            part_total = part_max
-        total += part_total
-
-    total = max(0.0, min(total, float(max_score)))
-    unit = 0.5 if half_point else 1.0
-    total = math.floor(total / unit + 1e-9) * unit
-    if score_cap is not None:
-        cap = max(0.0, min(float(score_cap), float(max_score)))
-        if total > cap + 1e-9:
-            reasons.append(f"按评分说明，本题最多 {fmt_score(cap)} 分"
-                           f"（逐点合计 {fmt_score(total)}）")
-            total = math.floor(cap / unit + 1e-9) * unit
-
-    confidence = str(result.get("confidence", "")).strip()
-    if confidence.startswith("低") or confidence.lower().startswith("low"):
-        reasons.append("模型把握度低")
-    if result.get("unclear") is True or "【看不清】" in transcription:
-        reasons.append("有看不清的地方")
-    if uncovered:
-        reasons.append("有未覆盖解法，已按共用、结果和等价采分点计分")
-    return fmt_score(total), items, reasons
-
-
-def settle_score(result, max_score, half_point, score_cap=None, expected=None,
-                 allowed_deductions=None, card=None):
-    """按给分点加总得到最终分，并返回需要人工复核的原因列表"""
-    import math
-    import re
-    if isinstance(card, dict) and card.get("parts"):
-        return settle_score_v2(result, card, max_score, half_point, score_cap,
-                               allowed_deductions)
-    reasons = []
-    items = []
-    for it in result.get("items") or []:
-        if not isinstance(it, dict):
-            continue
-        try:
-            full = float(it.get("full", 0) or 0)
-            got = float(it.get("got", 0) or 0)
-        except (TypeError, ValueError):
-            reasons.append("给分点数据异常")
-            continue
-        got = max(0.0, min(got, full)) if full > 0 else max(0.0, got)
-        items.append({"point": str(it.get("point", "")), "full": full, "got": got,
-                      "reason": str(it.get("reason", "") or ""),
-                      "evidence": str(it.get("evidence", "") or "").strip()})
-
-    if result.get("blank"):
-        return 0, items, reasons
-
-    # 给分点分值以评分标准为准：模型改了分值就强制回填，确保不擅自加码
-    expected = [(str(p), float(v)) for p, v in (expected or [])]
-    # 没有可对照的标准时，模型偶尔会把「累计分」当成各点满分（如 1/3/4 … 17 合计 92）
-    if not expected and len(items) >= 3:
-        vals = [it["full"] for it in items]
-        if is_cumulative_scale(vals, max_score):
-            prev_full = prev_got = 0.0
-            for it in items:
-                f, g = it["full"], it["got"]
-                it["full"] = max(0.0, round(f - prev_full, 2))
-                it["got"] = max(0.0, min(round(g - prev_got, 2), it["full"]))
-                prev_full, prev_got = f, g
-            reasons.append("模型返回的是累计分，已换算为每步增量")
-    if expected and items:
-        if len(items) == len(expected):
-            model_cumulative = is_cumulative_scale([it["full"] for it in items], max_score)
-            if model_cumulative:
-                prev_got = 0.0
-                for it in items:
-                    g = it["got"]
-                    it["got"] = max(0.0, round(g - prev_got, 2))
-                    prev_got = g
-                reasons.append("模型按累计分返回，已换算为每步增量并对照标准")
-            for it, (_, val) in zip(items, expected):
-                if abs(it["full"] - val) > 1e-9 and not model_cumulative:
-                    reasons.append(f"模型改了给分点分值，已按标准回填 {fmt_score(val)} 分")
-                it["full"] = val
-                it["got"] = max(0.0, min(it["got"], val))
-        else:
-            reasons.append("模型返回的给分点条数与评分标准不一致，请复核")
-
-    # 除了标准明确写出的“扣 N 分”，每个给分点只能是 0 或满分，禁止模型自行给部分分
-    partial_items = []
-    score_adjusted = False
-    for item_index, it in enumerate(items):
-        if it["got"] <= 0 or it["full"] <= 0:
-            continue
-        if it["got"] >= it["full"] - 1e-6:
-            it["got"] = it["full"]
-            continue
-        deduction = round(it["full"] - it["got"], 2)
-        if not deduction_allowed(item_index, deduction, allowed_deductions):
-            reason = str(it.get("reason", "") or "")
-            complete_words = ("完整", "齐全", "均正确", "全部正确", "两解均", "两解都")
-            bad_words = ("漏", "缺", "未", "错", "不完整", "少")
-            if it["evidence"] and any(w in reason for w in complete_words) \
-                    and not any(w in reason for w in bad_words):
-                it["got"] = it["full"]
-                reasons.append(f"{it['point'][:12]}理由写明完整，已按满分")
-                score_adjusted = True
-                continue
-            partial_items.append(it)
-            it["got"] = 0.0
-            score_adjusted = True
-    if partial_items:
-        names = "、".join(it["point"][:12] for it in partial_items[:3])
-        more = f" 等 {len(partial_items)} 处" if len(partial_items) > 3 else ""
-        reasons.append(f"{names}{more}给了标准未写明的部分分，已按 0 分")
-
-    # 证据制：没引用学生原文的得分一律作废，杜绝“凭印象给分”
-    raw_items = [it for it in (result.get("items") or []) if isinstance(it, dict)]
-    has_evidence_field = any("evidence" in it for it in raw_items)
-    evidence_enforced = False
-    if has_evidence_field:
-        no_evidence = [it for it in items if it["got"] > 0 and not it["evidence"]]
-        for it in no_evidence:
-            it["got"] = 0.0
-        evidence_enforced = bool(no_evidence)
-        if no_evidence:
-            names = "、".join(it["point"][:12] for it in no_evidence[:3])
-            more = f" 等 {len(no_evidence)} 处" if len(no_evidence) > 3 else ""
-            reasons.append(f"{names}{more}没有引用学生原文，已按 0 分")
-        transcription = str(result.get("transcription", "") or "")
-        if transcription:
-            unmatched = [it for it in items if it["got"] > 0
-                         and not evidence_supported(it["evidence"], transcription)]
-            for it in unmatched:
-                it["got"] = 0.0
-            if unmatched:
-                names = "、".join(it["point"][:12] for it in unmatched[:3])
-                more = f" 等 {len(unmatched)} 处" if len(unmatched) > 3 else ""
-                reasons.append(f"{names}{more}的依据在答卷原文中找不到，已按 0 分")
-                evidence_enforced = True
-        else:
-            positives = [it for it in items if it["got"] > 0]
-            for it in positives:
-                it["got"] = 0.0
-            if positives:
-                reasons.append("模型没有提供学生原文转写，无法校验依据，相关得分已按 0 分")
-                evidence_enforced = True
-    elif items:
-        positives = [it for it in items if it["got"] > 0]
-        for it in positives:
-            it["got"] = 0.0
-        if positives:
-            reasons.append("模型未附学生原文依据，相关得分已按 0 分")
-            evidence_enforced = True
-
-    if items:
-        sub_re = re.compile(r"(合计|小计|总分|总计|第\s*[（(]?[一二三1-3][)）]?\s*问\s*合计)")
-        subtotals = [i for i in items if sub_re.search(i["point"])]
-        sub_ids = {id(i) for i in subtotals}
-        details = [i for i in items if id(i) not in sub_ids]
-        scoring = items
-        if subtotals and abs(sum(i["full"] for i in subtotals) - float(max_score)) <= 0.01:
-            scoring = subtotals
-            reasons.append("模型给了小计行，已按小计计分")
-        elif details and abs(sum(i["full"] for i in details) - float(max_score)) <= 0.01:
-            scoring = details
-            if subtotals:
-                reasons.append("小计行合计≠满分，已忽略小计行")
-        elif subtotals:
-            scoring = details or items
-            reasons.append("小计行合计≠满分，请核对给分点")
-
-        total = sum(i["got"] for i in scoring)
-        full_sum = sum(i["full"] for i in scoring)
-        if full_sum > max_score + 0.01:
-            reasons.append(f"给分点合计 {fmt_score(full_sum)} 分超过满分 {fmt_score(max_score)}，已按满分封顶；"
-                           f"请核对评分标准是否写成了累计分")
-        elif abs(full_sum - max_score) > 0.01:
-            reasons.append(f"给分点合计 {fmt_score(full_sum)} 分≠满分")
-        try:
-            claimed = float(result.get("score"))
-            if abs(claimed - total) > 0.01 and not evidence_enforced and not score_adjusted:
-                reasons.append(f"模型总分 {fmt_score(claimed)} 与逐点相加 {fmt_score(total)} 不一致")
-        except (TypeError, ValueError):
-            pass
-    else:
-        reasons.append("模型没有给出逐点得分")
-        try:
-            total = float(result.get("score", 0))
-        except (TypeError, ValueError):
-            total = 0.0
-
-    total = max(0.0, min(total, float(max_score)))
-    unit = 0.5 if half_point else 1.0
-    total = math.floor(total / unit + 1e-9) * unit   # 向下取整到最小单位，绝不多给
-    if score_cap is not None:
-        cap = max(0.0, min(float(score_cap), float(max_score)))
-        if total > cap + 1e-9:
-            reasons.append(f"按评分说明，本题最多 {fmt_score(cap)} 分（逐点合计 {fmt_score(total)}）")
-            total = math.floor(cap / unit + 1e-9) * unit   # 上限向下取整，绝不超上限
-
-    conf = str(result.get("confidence", "")).strip()
-    if conf.startswith("低") or conf.lower().startswith("low"):
-        reasons.append("模型把握度低")
-    if result.get("unclear") is True or "【看不清】" in str(result.get("transcription", "")):
-        reasons.append("有看不清的地方")
-    if result.get("alt_method") is True:
-        reasons.append("学生用了其他解法")
-    return fmt_score(total), items, reasons
-
-
-def choose_consensus(samples):
-    """多次判分里选一次采用：3 次取中位数；2 次优先高把握，把握相同取较低分。"""
-    if not samples:
-        raise ValueError("没有可用的判分结果")
-
-    def conf_rank(sample):
-        c = str(sample[1].get("confidence", "")).strip()
-        return {"高": 2, "中": 1, "低": 0}.get(c[:1], 1)
-
-    if len(samples) >= 3:
-        ordered = sorted(samples, key=lambda x: (float(x[0]), -conf_rank(x)))
-        return ordered[len(ordered) // 2]
-    if len(samples) == 2:
-        r0, r1 = conf_rank(samples[0]), conf_rank(samples[1])
-        if r0 != r1:
-            return samples[0] if r0 > r1 else samples[1]
-        return min(samples, key=lambda x: float(x[0]))
-    return samples[0]
-
-
 def ink_ratio(img):
     """答题区域里“墨迹”像素的占比，用来判断空白卷"""
     try:
@@ -2823,7 +1704,6 @@ def trim_bottom_taskbar(img, max_ratio=0.18, min_px=24):
         return img.crop((0, 0, w, keep_h)), cut
     except Exception:
         return img, 0
-
 
 
 class SimpleGradingUI:
@@ -4150,6 +3030,38 @@ class SimpleGradingUI:
         thread.daemon = True
         thread.start()
     
+    def current_grading_card(self, standard_answer, question_num, max_score_f):
+        """取本次判分用的评分卡：已确认且与当前标准一致的卡优先；
+        否则按当前标准自动生成；生成不了就用整题兜底卡。不会静默改用别的评分方式。"""
+        rubric = self.rubric_text.get('1.0', tk.END).strip()
+        card = getattr(self, 'rubric_card', None)
+        if card:
+            card = upgrade_rubric_card(card, max_score_f)
+        if not (card and card_is_fresh(card, standard_answer, rubric, max_score_f)
+                and not validate_rubric_card(card, max_score_f)):
+            card = build_rubric_card(standard_answer, rubric, question_num, max_score_f)
+            if card and not validate_rubric_card(card, max_score_f):
+                self.rubric_card = card
+                self.root.after(0, self.save_config)
+                self.root.after(0, self.refresh_answer_summary)
+            else:
+                points, _src, _rules = resolve_rubric_points(rubric, standard_answer, max_score_f)
+                card = gc.single_part_card(points, max_score_f)
+                if card.get("parts")[0]["methods"][0]["points"][0]["text"].startswith("按参考答案整体"):
+                    self.log("  ⚠ 没能从评分标准拆出给分点，本题按整题一个采分点判分；"
+                             "建议在「评分卡」里拆分后再批")
+        fp = card.get("fingerprint") or id(card)
+        if getattr(self, '_card_logged', None) != fp:
+            self._card_logged = fp
+            lines = []
+            for part in card.get("parts") or []:
+                m = (part.get("methods") or [{}])[0]
+                pts = " + ".join(str(fmt_score(p.get("full", 0))) for p in m.get("points") or [])
+                extra = f"，另有 {len(part['methods']) - 1} 套解法" if len(part.get("methods") or []) > 1 else ""
+                lines.append(f"第{part.get('id')}问 {fmt_score(part.get('max_score', 0))}分（{pts}{extra}）")
+            self.log("  📋 评分卡：" + "；".join(lines))
+        return card
+
     def _grade_thread(self):
         """批改线程"""
         try:
@@ -4200,130 +3112,39 @@ class SimpleGradingUI:
                 extra_reasons.append(f"截图彩色像素较多（{color:.0%}），请确认不是课程表/网页")
 
             # 空白卷直接 0 分，不浪费 API 额度
+            api_elapsed = 0.0
+            needs_review = False
             if ink < self.blank_threshold:
                 result = {
                     "score": 0, "items": [], "blank": True, "confidence": "高",
                     "unclear": False, "alt_method": False,
                     "analysis": f"答题区域几乎是空白（墨迹占比 {ink:.4f}），按 0 分。",
                 }
-                score, items, reasons = settle_score(result, max_score_f, self.half_point)
+                score, items, reasons = 0, [], []
                 self.log(f"  ⚪ 空白卷，直接记 0 分（墨迹 {ink:.4f}）")
             else:
-                rubric = self.rubric_text.get('1.0', tk.END).strip()
-                card = getattr(self, 'rubric_card', None)
-                if card:
-                    card = upgrade_rubric_card(card, max_score_f)
-                card_ok = bool(card) and card_is_fresh(card, standard_answer, rubric, max_score_f) \
-                    and not validate_rubric_card(card, max_score_f)
-                if card_ok:
-                    expected_points = [(p["text"], float(p["full"]))
-                                       for p in card_flat_points(card)]
-                    rubric_source = "card"
-                    rules = rules_from_card(card)
-                else:
-                    # 评分卡可能因为换行符、答案恢复或旧版本字段而失效。
-                    # 不能直接退回扁平给分点，否则会丢掉小问/结果点/等价解法；
-                    # 先按当前标准自动重建一张卡，重建失败才退回文本模式。
-                    rebuilt = build_rubric_card(
-                        standard_answer, rubric, question_num, max_score_f)
-                    if rebuilt and not validate_rubric_card(rebuilt, max_score_f):
-                        card = rebuilt
-                        self.rubric_card = rebuilt
-                        card_ok = True
-                        rubric_source = "card"
-                        rules = rules_from_card(rebuilt)
-                        expected_points = [(p["text"], float(p["full"]))
-                                           for p in card_flat_points(rebuilt)]
-                        self.log("  🔄 评分卡已按当前标准自动重建，按小问/结果点判分")
-                        self.root.after(0, self.save_config)
-                        self.root.after(0, self.refresh_answer_summary)
-                    else:
-                        if card:
-                            self.log("  ⚠ 评分卡重建失败，已按最新文本判分")
-                        expected_points, rubric_source, rules = resolve_rubric_points(
-                            rubric, standard_answer, max_score_f)
-                source_name = {"rubric": "手填给分点", "answer": "参考答案中的评分标准",
-                               "auto": "从参考答案自动拆分",
-                               "card": "评分卡（已确认）"}.get(rubric_source, "")
-                if expected_points:
-                    self.log(f"  📋 {source_name}：{len(expected_points)} 条，合计 "
-                             f"{fmt_score(sum(v for _, v in expected_points))} 分")
-                if rules["cumulative"]:
-                    raw = "、".join(str(fmt_score(v)) for v in rules["cumulative_raw"])
-                    if card_ok and card.get("score_mode") == "bands":
-                        bands = format_band_card_summary(card)
-                        self.log(f"  📋 原标准累计分（{raw}），已按小问合并为 {len(expected_points)} "
-                                 f"个分档评分单元：{bands}；不再拆成逐句小点")
-                    else:
-                        incs = " + ".join(str(fmt_score(v)) for _, v in expected_points)
-                        self.log(f"  📋 标准写作累计分（{raw}），已换算为每步增量：{incs} = "
-                                 f"{fmt_score(sum(v for _, v in expected_points))} 分")
-                if rules["score_cap"] is not None:
-                    self.log(f"  📏 评分规则：本题最多 {fmt_score(rules['score_cap'])} 分（程序强制）"
-                             f"（{rules['cap_text'][:50]}）")
-                if rules["zero_rules"]:
-                    self.log(f"  📏 零分规则 {len(rules['zero_rules'])} 条（请人工复核对应步骤）")
-                prompt = build_grading_prompt(question_num, max_score, standard_answer, rubric,
-                                              self.half_point, card if card_ok else None)
-                # 单次判分：严格按评分标准只判一次，不做多次采样
-                api_elapsed = 0.0
+                card = self.current_grading_card(standard_answer, question_num, max_score_f)
+                prompt = gc.build_prompt(question_num, max_score, standard_answer, card,
+                                         self.half_point)
+                # 一份答卷只调用一次模型；JSON 解析失败直接报错交给老师，不重试
+                api_start = time.time()
                 try:
-                    api_start = time.time()
                     result = self.call_ai_api(prompt, grade_img, need_json=True)
-                    api_elapsed += time.time() - api_start
-                except Exception as e:
-                    api_elapsed += time.time() - api_start
-                    msg = str(e)
-                    if any(k in msg for k in ("Expecting", "delimiter", "JSON", "control character",
-                                              "Unterminated", "Invalid")):
-                        self.log(f"  ⚠ 模型返回的 JSON 不完整（{msg[:60]}），重试一次…")
-                        api_start = time.time()
-                        result = self.call_ai_api(
-                            prompt + "\n\n严格要求：只输出一个 JSON 对象；transcription 和 evidence 都写成一行，"
-                                     "不要换行，不要出现英文双引号（需要引用时用「」）；不要输出任何解释。",
-                            grade_img, need_json=True)
-                        api_elapsed += time.time() - api_start
-                    else:
-                        raise
-                if card_ok and card.get("parts"):
-                    missing_parts = missing_card_parts(result, card)
-                    if missing_parts:
-                        self.log(f"  ⚠ 模型缺少第{'、'.join(missing_parts)}小问，重试一次…")
-                        try:
-                            api_start = time.time()
-                            retry_result = self.call_ai_api(
-                                prompt + "\n\n严格要求：上一次返回缺少第"
-                                         + "、".join(missing_parts) + "小问。"
-                                         "必须为评分卡里的每一个小问各返回一个 parts 对象，"
-                                         "part_id 分别为 "
-                                         + "、".join(str(p.get("id")) for p in card.get("parts") or [])
-                                         + "；没有覆盖的也要返回 method_id=uncovered 和 points=[]，"
-                                           "共用点仍按【共用】规则返回。"
-                                           "不能只返回有分的小问，不能合并小问。",
-                                grade_img, need_json=True)
-                            api_elapsed += time.time() - api_start
-                            result = merge_grading_results(result, retry_result, card)
-                        except Exception as retry_error:
-                            api_elapsed += time.time() - api_start
-                            self.log(f"  ⚠ 多解法格式重试失败：{str(retry_error)[:80]}")
+                finally:
+                    api_elapsed = time.time() - api_start
                 if result.get('_salvaged'):
-                    self.log("  ⚠ 模型 JSON 有残缺，已尽力抢救出给分点，建议核对原文")
-                score, items, reasons = settle_score(result, max_score_f, self.half_point,
-                                                     rules["score_cap"], expected_points,
-                                                     rules.get("deduction_rules"),
-                                                     card=card if card_ok else None)
-                if card_ok and card.get("parts"):
-                    still_missing = missing_card_parts(result, card)
-                    if still_missing:
-                        reasons.append(
-                            f"模型没有返回第{'、'.join(still_missing)}小问，"
-                            f"相关分数按 0 分，建议重新批改")
-                self.log(f"  🧪 判分结果：{fmt_score(score)} 分")
+                    self.log("  ⚠ 模型 JSON 有残缺，已尽力抢救，请核对")
+                score, items, reasons, needs_review = gc.settle(
+                    result, card, max_score_f, self.half_point)
+                if result.get('_salvaged'):
+                    needs_review = True
+                self.log(f"  🧪 判分结果：{fmt_score(score)} 分（模型 {api_elapsed:.1f}s）")
                 result['score'] = score
                 result['items'] = items
-                save_result_debug(result, card if card_ok else None, score)
+                save_result_debug(result, card, score)
                 if ink > 0.90:
                     reasons.append(f"截图墨迹占比很高（{ink:.2f}），请确认不是黑屏/遮挡")
+            result['_review'] = needs_review
 
             result['_reasons'] = (reasons or []) + extra_reasons
             result['_ink'] = round(ink, 4)
@@ -4415,7 +3236,7 @@ class SimpleGradingUI:
                 + " · ".join(pieces))
         point_score_text = "\n".join(point_score_lines)
 
-        transcription = str(result.get("transcription", "") or "").strip()
+        transcription = str(result.get("reading") or result.get("transcription") or "").strip()
         if transcription:
             shown = transcription if len(transcription) <= 600 else transcription[:600] + "…"
             detail_text += f"\n学生原文: {shown}\n"
@@ -4428,6 +3249,8 @@ class SimpleGradingUI:
                 if reason:
                     detail_text += f"  {reason}"
                 detail_text += "\n"
+                if it.get('note'):
+                    detail_text += f"      ↳ {it['note']}\n"
                 ev = str(it.get('evidence', '') or '').strip()
                 if ev and float(got) > 0:
                     ev_show = ev if len(ev) <= 60 else ev[:60] + "…"
@@ -4456,7 +3279,45 @@ class SimpleGradingUI:
         self.waiting_for_confirm = True
         self.pending_score = score
         self._raise_window()
-        self.show_confirm_dialog(score, max_score, detail_text)
+        force = bool(result.get('_review'))
+        if force:
+            self.log("  ⚠ 模型输出有缺漏，本份需要人工确认")
+        self.show_confirm_dialog(score, max_score, detail_text, force=force)
+
+    def save_correction_case(self, model_score, teacher_score, max_score):
+        """老师改分时，把这份答卷存成评测用例（eval_cases/corrections/…），
+        以后改判分逻辑都用 eval.py 跑这些用例量准确率。只存在本机。"""
+        try:
+            img = getattr(self, 'current_student_img', None)
+            if img is None:
+                return
+            img, _ = trim_bottom_taskbar(img)
+            qnum = self.question_num_entry.get().strip() or "x"
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            case_dir = os.path.join(app_dir, "eval_cases", "corrections", f"q{qnum}_{stamp}")
+            os.makedirs(case_dir, exist_ok=True)
+            img.save(os.path.join(case_dir, "answer.png"))
+            rec = getattr(self, '_record', None)
+            items = (rec[0].get('items') if rec else None) or []
+            data = {
+                "question_num": qnum,
+                "max_score": float(max_score),
+                "half_point": bool(self.half_point),
+                "expected_total": float(teacher_score),
+                "model_total": float(model_score),
+                "answer": self.answer_text.get('1.0', tk.END).strip(),
+                "rubric": self.rubric_text.get('1.0', tk.END).strip(),
+                "model_items": [{k: it.get(k) for k in ("point_id", "point", "full", "got", "reason")}
+                                for it in items],
+                "model": getattr(self, '_last_model_used', None) or self.config.get('model_name', ''),
+                "created": datetime.now().isoformat(timespec="seconds"),
+            }
+            with open(os.path.join(case_dir, "expected.json"), "w", encoding="utf-8") as fp:
+                json.dump(data, fp, ensure_ascii=False, indent=2)
+            self.log(f"  💾 已存为评测用例：eval_cases/corrections/q{qnum}_{stamp}")
+        except Exception as e:
+            self.log(f"  ⚠ 保存评测用例失败：{e}")
 
     def _save_record(self):
         """在用户确认/改分后保存记录，保证 HTML/笔记里的分数是最终提交分。"""
@@ -4477,62 +3338,18 @@ class SimpleGradingUI:
         self.model = None
 
     def call_ai_api(self, prompt, image, need_json=True):
-        """调用当前提供商；额度/限流时自动回退到本机 Magpie。"""
+        """调用当前选定的提供商和模型。
+
+        不再自动换模型：同一批卷子必须由同一个模型批，评分尺度才一致。
+        额度用尽、网络出错时直接报错并停下，由老师决定是否换模型。"""
         try:
             return self._call_ai_api_once(prompt, image, need_json)
         except Exception as e:
             m = str(e).lower()
             if 'timed out' in m or 'timeout' in m or '超过' in m:
-                raise Exception(f"单题超过 {GRADE_TIMEOUT} 秒，已中止（请换更快的模型或检查网络）") from e
-            if self.config.get('provider') == 'Magpie':
-                gs = (self.provider_settings or {}).get('Gemini', {})
-                if gs.get('api_key'):
-                    self.log(f"  ↪ Magpie 不可用（{str(e).splitlines()[0][:60]}）；改用 Gemini…")
-                    return self._call_provider_with_settings('Gemini', gs, prompt, image, need_json)
-                raise
-            if not self._should_fallback(e):
-                raise
-            self.log(f"  ↪ {str(e).splitlines()[0][:80]}；自动改用本机 Magpie…")
-            try:
-                return self._call_magpie_fallback(prompt, image, need_json)
-            except Exception as e2:
-                raise Exception(f"{e}\n\n本机 Magpie 回退也失败：{e2}") from e2
+                raise Exception(f"单题超过 {GRADE_TIMEOUT} 秒，已中止（请检查网络或模型是否开了思考）") from e
+            raise
 
-    def _call_provider_with_settings(self, provider, settings, prompt, image, need_json):
-        """临时切换到另一个提供商调用，结束后恢复原配置。"""
-        old = dict(self.config)
-        try:
-            self.config.update(
-                provider=provider,
-                api_key=settings.get('api_key', ''),
-                base_url=settings.get('base_url', '') or PROVIDERS.get(provider, {}).get('base_url', ''),
-                model_name=settings.get('model_name', '')
-                or (PROVIDERS.get(provider, {}).get('models') or [''])[0],
-            )
-            return self._call_ai_api_once(prompt, image, need_json)
-        finally:
-            self.config = old
-
-    @staticmethod
-    def _should_fallback(err):
-        m = str(err).lower()
-        return any(k in m for k in (
-            "quota", "429", "exceeded", "rate limit", "resource_exhausted",
-            "额度", "key 池全部不可用", "no available key", "unavailable",
-        ))
-
-    def _call_magpie_fallback(self, prompt, image, need_json):
-        base, ver = magpie_detect()
-        if not base:
-            raise Exception("本机 Magpie 未运行（127.0.0.1:3425）。请打开 magpie，或在「模型」里换一个可用提供商")
-        key = PROVIDERS['Magpie']['default_key']
-        models = fetch_models(base, key)
-        model = choose_magpie_model(models)
-        if not model:
-            raise Exception("Magpie 没有可用模型")
-        self.log(f"  ↪ 本机 Magpie：{model}")
-        self._last_model_used = f"Magpie/{model}"
-        return self._openai_vision_call(base, key, model, prompt, image, need_json)
 
     def _openai_vision_call(self, base_url, api_key, model, prompt, image, need_json):
         """OpenAI 兼容的识图调用：灰度压缩 + 流式 + 自动关思考。"""
@@ -4578,7 +3395,7 @@ class SimpleGradingUI:
             gen_cfg = {"temperature": 0.1,
                        "responseMimeType": "application/json" if need_json else "text/plain"}
             if need_json:
-                gen_cfg["responseSchema"] = GRADING_SCHEMA
+                gen_cfg["responseSchema"] = gc.GRADING_SCHEMA
             if 'gemini-2.5' in (model_name or '') and 'pro' not in (model_name or ''):
                 gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
             body = _json.dumps({
@@ -5240,6 +4057,7 @@ class SimpleGradingUI:
             final_score = fmt_score(max(0, min(final_score, float(max_score))))
             if final_score != score:
                 self.log(f"✏ 人工改分: {score} → {final_score}")
+                self.save_correction_case(score, final_score, max_score)
             self.pending_score = final_score
             if self._record:
                 self._record[0]['score'] = final_score
@@ -5921,8 +4739,6 @@ class SimpleGradingUI:
             
         except Exception as e:
             self.log(f"⚠ 导出 HTML 失败: {str(e)}")
-
-
 
 
 def main():

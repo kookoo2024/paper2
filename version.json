@@ -1,10 +1,11 @@
 {
-  "version": "1.10.1",
-  "notes": "v1.10.1：修复分档日志出现 sequence item 0 expected str instance int found；统一档位分数格式化并增加回归测试",
+  "version": "1.11.0",
+  "notes": "判分逻辑重写：通用提示词一次调用；程序只做算术不改判（四舍五入、不再自动改0）；去掉针对单题的硬编码；一批固定一个模型不自动切换；老师改分自动存为评测用例",
   "files": {
-    "zhixue_simple.py": "43d9922945502da5e9a3f55725020cd896880364fd5b6199656f7868a040ed27",
-    "README.md": "af3346ac925424104e13830c12f06d72222a43ff4f59596be9a0a703c19a6247",
-    "requirements.txt": "f3eedb2916ec13628bdf4af5857fa0d46cad77cb2222ab334712ce02434c902a",
-    "eval.py": "63109d18501d292286c102b8d759adefdf2c2d53ea14f9cf7abb7f9ce247df6a"
+    "zhixue_simple.py": "2bee14f53263259a0ab8b296b48ada734a79fbc3ab398065ea403583eb4e7123",
+    "grading_core.py": "349941c5f1521955fa459b0538680a57c2746e59d388cba3dca9d40e52fb8851",
+    "README.md": "01e16a2065116a8d23f39495a2f305a033b5561d76cb52d476c174ac0dfb974c",
+    "requirements.txt": "907fef45f94d3c8f0e0ea05ebf7be3cf68b70d99a344743f655a5424619b22c3",
+    "eval.py": "66b0d06b57798a6a60e2a687aa078d206ae6aa7a9d15abb052dd6c7661961fae"
   }
 }

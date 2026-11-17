@@ -34,3 +34,6 @@ Grading_HTML/
 work/
 eval_reports/
 zhixue_simple_config1.json
+
+# 老师改分自动存下的评测用例（含学生答卷）
+eval_cases/corrections/

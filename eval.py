@@ -97,16 +97,13 @@ def build_case(case_dir, base_config, use_card=True):
     half_point = bool(expected.get("half_point", base_config.get("half_point", False)))
 
     card = z.build_rubric_card(answer, rubric, question_num, max_score) if use_card else None
-    card_ok = bool(card) and not z.validate_rubric_card(card, max_score)
-    if card_ok:
-        expected_points = [(p["text"], float(p["full"])) for p in card["points"]]
-        rules = z.rules_from_card(card)
+    if card and not z.validate_rubric_card(card, max_score):
         source = "评分卡"
     else:
-        expected_points, source, rules = z.resolve_rubric_points(rubric, answer, max_score)
-        card = None
-    if not expected_points:
-        raise ValueError("评分标准里没有解析出给分点")
+        points, _src, _rules = z.resolve_rubric_points(rubric, answer, max_score)
+        card = z.gc.single_part_card(points, max_score)
+        source = "整题兜底卡"
+    expected_points = [(p["text"], float(p["full"])) for p in z.card_flat_points(card)]
 
     expected_items = expected.get("items") or []
     if expected_items:
@@ -117,8 +114,7 @@ def build_case(case_dir, base_config, use_card=True):
             raise ValueError("没有 items 时必须提供 expected_total")
         expected_total = float(expected["expected_total"])
 
-    prompt = z.build_grading_prompt(question_num, max_score, answer, rubric,
-                                    half_point, card if card_ok else None)
+    prompt = z.gc.build_prompt(question_num, max_score, answer, card, half_point)
     return {
         "name": Path(case_dir).name,
         "dir": Path(case_dir),
@@ -131,9 +127,8 @@ def build_case(case_dir, base_config, use_card=True):
         "question_num": question_num,
         "half_point": half_point,
         "prompt": prompt,
-        "rules": rules,
         "source": source,
-        "card": card if card_ok else None,
+        "card": card,
     }
 
 
@@ -196,7 +191,6 @@ def run_case(case, config, dry_run=False):
     if dry_run:
         print("  图片：{}".format(case["image_path"]))
         print("  期望总分：{}".format(case["expected_total"]))
-        print("  评分说明：{} 条".format(len(case["rules"].get("notes") or [])))
         return None
 
     image = Image.open(case["image_path"]).convert("RGB")
@@ -205,10 +199,8 @@ def run_case(case, config, dry_run=False):
     try:
         result = grader.call_ai_api(case["prompt"], image, need_json=True)
         elapsed = time.time() - started
-        score, items, reasons = z.settle_score(
-            result, case["max_score"], case["half_point"],
-            case["rules"].get("score_cap"), case["expected_points"],
-            case["rules"].get("deduction_rules"), card=case.get("card"))
+        score, items, reasons, _review = z.gc.settle(
+            result, case["card"], case["max_score"], case["half_point"])
         result["score"] = score
         result["items"] = items
         result["_reasons"] = reasons
@@ -280,8 +272,18 @@ def write_reports(records, out_dir):
     if records:
         ok = [r for r in records if r["status"] == "ok"]
         if ok:
-            avg_err = sum(abs(r["metrics"]["total_error"]) for r in ok) / len(ok)
-            lines += ["", "- 平均总分绝对误差：{:.2f}".format(avg_err)]
+            errs = [r["metrics"]["total_error"] for r in ok]
+            avg_err = sum(abs(x) for x in errs) / len(ok)
+            exact = sum(1 for x in errs if abs(x) < 0.01) / len(ok)
+            within1 = sum(1 for x in errs if abs(x) <= 1.01) / len(ok)
+            bias = sum(errs) / len(ok)
+            lines += ["",
+                      "- 总分完全一致：{:.0%}".format(exact),
+                      "- 误差在 ±1 分以内：{:.0%}".format(within1),
+                      "- 平均总分绝对误差：{:.2f}".format(avg_err),
+                      "- 平均偏差：{:+.2f}（正数=程序偏高，负数=偏低）".format(bias)]
+            print("\n完全一致 {:.0%}，±1 分内 {:.0%}，平均绝对误差 {:.2f}，平均偏差 {:+.2f}".format(
+                exact, within1, avg_err, bias))
         errors = [r for r in records if r["status"] != "ok"]
         if errors:
             lines += ["", "## 失败用例", ""]
@@ -343,8 +345,8 @@ def main():
         return 2
     config = read_json(config_path)
 
-    case_dirs = [p for p in sorted(cases_dir.iterdir())
-                 if p.is_dir() and (p / "expected.json").is_file()]
+    # 递归查找，老师改分自动存的用例在 eval_cases/corrections/ 下面
+    case_dirs = sorted(p.parent for p in cases_dir.rglob("expected.json"))
     if args.limit:
         case_dirs = case_dirs[:args.limit]
     if not case_dirs:
